@@ -1,0 +1,6 @@
+{
+    "calibredb_path": "C:\\Program Files\\Calibre2\\calibredb.exe",
+    "library_path": "C:\\Users\\YourName\\Calibre Library",
+    "backup_before_bulk_ops": true,
+    "dry_run_by_default": true
+}
