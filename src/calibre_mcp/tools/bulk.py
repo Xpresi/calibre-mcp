@@ -1,0 +1,817 @@
+"""Bulk cleanup operations for the Calibre library (Hito 4)."""
+
+import logging
+import re
+import shutil
+import sqlite3
+from pathlib import Path
+from typing import Any
+
+from ..utils.titlecase import smart_title_case, is_all_uppercase
+
+logger = logging.getLogger("calibre_mcp")
+
+
+# ── Path-fixing helpers ────────────────────────────────────────────────────
+
+def _calibre_sanitize(s: str) -> str:
+    """
+    Sanitize a string to a Calibre-compatible filesystem path component.
+    Calibre replaces backslash, forward slash, colon, asterisk, question mark,
+    double quote, angle brackets, pipe, AND periods with underscores on Windows.
+    """
+    s = re.sub(r'[\\/:*?"<>|.]', '_', s)
+    s = s.strip()
+    return s[:200]
+
+
+def fix_book_paths(
+    backend,
+    book_ids: list[int] | None = None,
+    dry_run: bool = True,
+) -> dict[str, Any]:
+    """
+    Rename book directories on disk to match current author/title in DB,
+    and update books.path accordingly.
+
+    Use this after bulk metadata edits that bypassed calibredb (direct SQLite),
+    which leaves directory names stale.
+
+    Args:
+        book_ids: Specific book IDs to check. If None, scans all books.
+        dry_run: If True, only report what would change.
+    """
+    library_path = Path(backend.config.library_path)
+
+    # Use a CTE to get each book's first author efficiently (avoids N correlated subqueries)
+    if book_ids:
+        placeholders = ",".join("?" * len(book_ids))
+        books = backend.query_db(f"""
+            WITH first_authors AS (
+                SELECT book, MIN(id) AS min_id FROM books_authors_link GROUP BY book
+            )
+            SELECT b.id, b.title, b.path, a.name AS author_name
+            FROM books b
+            LEFT JOIN first_authors fa ON fa.book = b.id
+            LEFT JOIN books_authors_link bal ON bal.id = fa.min_id
+            LEFT JOIN authors a ON a.id = bal.author
+            WHERE b.id IN ({placeholders})
+        """, tuple(book_ids))
+    else:
+        books = backend.query_db("""
+            WITH first_authors AS (
+                SELECT book, MIN(id) AS min_id FROM books_authors_link GROUP BY book
+            )
+            SELECT b.id, b.title, b.path, a.name AS author_name
+            FROM books b
+            LEFT JOIN first_authors fa ON fa.book = b.id
+            LEFT JOIN books_authors_link bal ON bal.id = fa.min_id
+            LEFT JOIN authors a ON a.id = bal.author
+        """)
+
+    fixes = []
+    for book in books:
+        if not book["author_name"]:
+            continue
+
+        current_path = book["path"]
+        author_dir  = _calibre_sanitize(book["author_name"])
+        book_dir    = _calibre_sanitize(f"{book['title']} ({book['id']})")
+        expected_path = f"{author_dir}/{book_dir}"
+
+        if current_path == expected_path:
+            continue
+
+        # In dry_run skip filesystem checks (avoids thousands of disk I/Os on big libraries)
+        fixes.append({
+            "id":           book["id"],
+            "title":        book["title"],
+            "author":       book["author_name"],
+            "current_path": current_path,
+            "expected_path": expected_path,
+        })
+
+    if dry_run:
+        return {
+            "status":       "dry_run",
+            "checked":      len(books),
+            "fixes_needed": len(fixes),
+            "fixes":        fixes[:100],
+            "message":      f"Found {len(fixes)} path(s) to fix. Set dry_run=false to apply.",
+        }
+
+    if not fixes:
+        return {"status": "no_action", "message": "All paths are already correct."}
+
+    # Apply fixes — use incremental commits (COMMIT_EVERY books) so that partial
+    # progress is preserved if the MCP call is cancelled (e.g. client-side timeout).
+    COMMIT_EVERY = 1000
+    db_path = str(backend.db_path)
+    conn = sqlite3.connect(db_path, timeout=15)
+    applied, errors = [], []
+
+    try:
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("BEGIN")
+        pending_in_txn = 0
+
+        for fix in fixes:
+            try:
+                current_full  = library_path / fix["current_path"]
+                expected_full = library_path / fix["expected_path"]
+
+                # On Windows NTFS (case-insensitive), a case-only rename means source and
+                # destination point to the same physical directory.  We skip both the
+                # filesystem rename AND the exists() check (saves ~0.5 ms/book on NTFS)
+                # and just update books.path in the DB.
+                is_case_only = (
+                    fix["current_path"].lower() == fix["expected_path"].lower()
+                )
+
+                if not is_case_only:
+                    if current_full.exists():
+                        # Ensure target parent (author dir) exists
+                        expected_full.parent.mkdir(parents=True, exist_ok=True)
+
+                        if expected_full.exists():
+                            # Target already exists: merge files (don't overwrite)
+                            for child in current_full.iterdir():
+                                dest = expected_full / child.name
+                                if not dest.exists():
+                                    shutil.move(str(child), str(dest))
+                            current_full.rmdir()
+                        else:
+                            shutil.move(str(current_full), str(expected_full))
+
+                        # Remove old author dir if now empty
+                        old_parent = current_full.parent
+                        if old_parent != library_path and old_parent.exists():
+                            if not any(old_parent.iterdir()):
+                                old_parent.rmdir()
+                                logger.info(f"Removed empty author dir: {old_parent.name}")
+
+                    elif not expected_full.exists():
+                        errors.append({"id": fix["id"],
+                                       "error": f"Directory not found: {fix['current_path']}"})
+                        continue
+                    # else: expected already exists → just update DB path
+
+                # Update books.path in DB
+                conn.execute("UPDATE books SET path=? WHERE id=?",
+                             (fix["expected_path"], fix["id"]))
+                applied.append(fix["id"])
+                pending_in_txn += 1
+
+                # Incremental commit to preserve progress on timeout/cancel
+                if pending_in_txn >= COMMIT_EVERY:
+                    conn.execute("COMMIT")
+                    conn.execute("BEGIN")
+                    pending_in_txn = 0
+
+            except Exception as exc:
+                errors.append({"id": fix["id"], "error": str(exc)})
+
+        conn.execute("COMMIT")  # final commit for remaining batch
+
+    except Exception as exc:
+        try:
+            conn.execute("ROLLBACK")
+        except Exception:
+            pass
+        return {"status": "error", "message": str(exc)}
+    finally:
+        conn.close()
+
+    return {
+        "status":       "success",
+        "applied":      len(applied),
+        "errors":       len(errors),
+        "details":      applied,
+        "error_details": errors,
+    }
+
+
+def merge_authors(
+    backend,
+    canonical_id: int,
+    variant_ids: list[int],
+    dry_run: bool = True,
+) -> dict[str, Any]:
+    """
+    Merge author variants into a canonical author.
+
+    All books linked to variant authors get relinked to the canonical author.
+    Uses direct SQLite writes (calibredb times out on large libraries).
+
+    Args:
+        canonical_id: The author ID to keep
+        variant_ids: Author IDs to merge into canonical
+        dry_run: If True, only show what would change
+    """
+    if not variant_ids:
+        return {"status": "no_action", "message": "No variant IDs provided."}
+
+    # Get canonical author info
+    canonical = backend.query_db(
+        "SELECT id, name, sort FROM authors WHERE id = ?", (canonical_id,)
+    )
+    if not canonical:
+        return {"status": "error", "message": f"Canonical author ID {canonical_id} not found."}
+    canonical = canonical[0]
+
+    # Get variant authors and their books
+    all_ids = ",".join("?" * len(variant_ids))
+    variants = backend.query_db(f"""
+        SELECT a.id, a.name, COUNT(bal.book) as book_count
+        FROM authors a
+        LEFT JOIN books_authors_link bal ON a.id = bal.author
+        WHERE a.id IN ({all_ids})
+        GROUP BY a.id
+    """, tuple(variant_ids))
+
+    # Get books for each variant
+    affected_books = []
+    for v in variants:
+        books = backend.query_db("""
+            SELECT b.id, b.title
+            FROM books b
+            JOIN books_authors_link bal ON b.id = bal.book
+            WHERE bal.author = ?
+        """, (v["id"],))
+        for book in books:
+            affected_books.append({
+                "book_id": book["id"],
+                "title": book["title"],
+                "old_author_id": v["id"],
+                "old_author": v["name"],
+            })
+
+    if dry_run:
+        return {
+            "status": "dry_run",
+            "canonical": canonical,
+            "variants": variants,
+            "affected_books": affected_books,
+            "message": (
+                f"Would merge {len(variants)} variant(s) into '{canonical['name']}', "
+                f"affecting {len(affected_books)} book(s). Set dry_run=false to execute."
+            ),
+        }
+
+    if not affected_books and not variants:
+        return {"status": "no_action", "message": "No books to reroute."}
+
+    # ── Apply via direct SQLite (calibredb times out on large libraries) ────
+    db_path = str(backend.db_path)
+    errors = []
+    try:
+        conn = sqlite3.connect(db_path, timeout=30)
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("BEGIN")
+
+        for book in affected_books:
+            try:
+                # Check if the book already has canonical author linked
+                already = conn.execute(
+                    "SELECT id FROM books_authors_link WHERE book=? AND author=?",
+                    (book["book_id"], canonical_id),
+                ).fetchone()
+
+                if already:
+                    # Just remove the variant link
+                    conn.execute(
+                        "DELETE FROM books_authors_link WHERE book=? AND author=?",
+                        (book["book_id"], book["old_author_id"]),
+                    )
+                else:
+                    # Reroute: point existing link to canonical
+                    conn.execute(
+                        "UPDATE books_authors_link SET author=? WHERE book=? AND author=?",
+                        (canonical_id, book["book_id"], book["old_author_id"]),
+                    )
+
+                # Update denormalized author_sort on books table
+                conn.execute(
+                    "UPDATE books SET author_sort=? WHERE id=?",
+                    (canonical["sort"], book["book_id"]),
+                )
+            except Exception as exc:
+                errors.append({"book_id": book["book_id"], "error": str(exc)})
+
+        # Delete variant author records (only if they have no remaining links)
+        for v in variants:
+            remaining = conn.execute(
+                "SELECT COUNT(*) FROM books_authors_link WHERE author=?", (v["id"],)
+            ).fetchone()[0]
+            if remaining == 0:
+                conn.execute("DELETE FROM authors WHERE id=?", (v["id"],))
+
+        conn.execute("COMMIT")
+        conn.close()
+    except Exception as exc:
+        try:
+            conn.execute("ROLLBACK")
+            conn.close()
+        except Exception:
+            pass
+        return {"status": "error", "message": str(exc)}
+
+    # Check if any affected books have multiple authors (co-author situation)
+    affected_ids = [b["book_id"] for b in affected_books]
+    multi_author_warning = None
+    if affected_ids:
+        ph = ",".join("?" * len(affected_ids))
+        multi = backend.query_db(f"""
+            SELECT book, COUNT(*) as cnt
+            FROM books_authors_link
+            WHERE book IN ({ph})
+            GROUP BY book
+            HAVING cnt > 1
+        """, tuple(affected_ids))
+        if multi:
+            multi_author_warning = (
+                f"{len(multi)} book(s) have multiple authors. "
+                f"Run fix_author_sort to correct their author_sort field."
+            )
+
+    result = {
+        "status": "completed",
+        "canonical": canonical,
+        "merged_variants": len(variants),
+        "books_updated": len(affected_books) - len(errors),
+        "errors": errors,
+    }
+    if multi_author_warning:
+        result["warning"] = multi_author_warning
+
+    return result
+
+
+def normalize_uppercase(
+    backend,
+    item_type: str = "titles",
+    limit: int = 100,
+    dry_run: bool = True,
+) -> dict[str, Any]:
+    """
+    Convert ALL UPPERCASE titles/tags/publishers to Title Case.
+
+    Apply uses direct SQLite (fast for large libraries; calibredb times out).
+
+    Args:
+        item_type: 'titles', 'tags', or 'publishers'
+        limit: Maximum items to process
+        dry_run: If True, only show what would change
+    """
+    from .write import _compute_title_sort
+
+    changes = []
+
+    if item_type == "titles":
+        rows = backend.query_db("SELECT id, title FROM books")
+        for r in rows:
+            if is_all_uppercase(r["title"]):
+                new_title = smart_title_case(r["title"])
+                if new_title != r["title"]:
+                    changes.append({
+                        "id": r["id"],
+                        "old": r["title"],
+                        "new": new_title,
+                    })
+                    if len(changes) >= limit:
+                        break
+
+    elif item_type == "tags":
+        rows = backend.query_db("""
+            SELECT t.id, t.name, COUNT(btl.book) as book_count
+            FROM tags t LEFT JOIN books_tags_link btl ON t.id = btl.tag
+            GROUP BY t.id
+        """)
+        for r in rows:
+            if is_all_uppercase(r["name"]):
+                new_name = smart_title_case(r["name"])
+                if new_name != r["name"]:
+                    changes.append({
+                        "id": r["id"],
+                        "old": r["name"],
+                        "new": new_name,
+                        "book_count": r["book_count"],
+                    })
+                    if len(changes) >= limit:
+                        break
+
+    elif item_type == "publishers":
+        rows = backend.query_db("""
+            SELECT p.id, p.name, COUNT(bpl.book) as book_count
+            FROM publishers p LEFT JOIN books_publishers_link bpl ON p.id = bpl.publisher
+            GROUP BY p.id
+        """)
+        for r in rows:
+            if is_all_uppercase(r["name"]):
+                new_name = smart_title_case(r["name"])
+                if new_name != r["name"]:
+                    changes.append({
+                        "id": r["id"],
+                        "old": r["name"],
+                        "new": new_name,
+                        "book_count": r["book_count"],
+                    })
+                    if len(changes) >= limit:
+                        break
+    else:
+        return {"status": "error", "message": f"Unknown item_type: {item_type}. Use 'titles', 'tags', or 'publishers'."}
+
+    if dry_run:
+        return {
+            "status": "dry_run",
+            "item_type": item_type,
+            "changes": changes,
+            "total": len(changes),
+            "message": f"Would normalize {len(changes)} {item_type}. Set dry_run=false to execute.",
+        }
+
+    if not changes:
+        return {"status": "no_action", "message": "No uppercase items found."}
+
+    # ── Apply via direct SQLite (calibredb times out on large libraries) ────
+    db_path = str(backend.db_path)
+    try:
+        conn = sqlite3.connect(db_path, timeout=30)
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("BEGIN")
+
+        if item_type == "titles":
+            for ch in changes:
+                new_sort = _compute_title_sort(ch["new"])
+                conn.execute(
+                    "UPDATE books SET title=?, sort=? WHERE id=?",
+                    (ch["new"], new_sort, ch["id"]),
+                )
+
+        elif item_type == "tags":
+            # Tags table has a unique constraint on name — rename directly
+            for ch in changes:
+                conn.execute(
+                    "UPDATE tags SET name=? WHERE id=?",
+                    (ch["new"], ch["id"]),
+                )
+
+        elif item_type == "publishers":
+            # Publishers table has a unique constraint on name — rename directly
+            for ch in changes:
+                conn.execute(
+                    "UPDATE publishers SET name=? WHERE id=?",
+                    (ch["new"], ch["id"]),
+                )
+
+        conn.execute("COMMIT")
+        conn.close()
+    except Exception as exc:
+        try:
+            conn.execute("ROLLBACK")
+            conn.close()
+        except Exception:
+            pass
+        return {"status": "error", "message": str(exc)}
+
+    return {
+        "status": "completed",
+        "item_type": item_type,
+        "total_changes": len(changes),
+        "successful": len(changes),
+        "errors": [],
+    }
+
+
+def fix_series_numbers(
+    backend,
+    series_id: int,
+    assignments: list[dict[str, Any]],
+    dry_run: bool = True,
+) -> dict[str, Any]:
+    """
+    Fix series numbering by assigning specific indices to books.
+
+    Args:
+        series_id: The series to fix
+        assignments: List of {"book_id": int, "index": float} dicts
+        dry_run: If True, only show what would change
+    """
+    # Verify series exists
+    series = backend.query_db("SELECT id, name FROM series WHERE id = ?", (series_id,))
+    if not series:
+        return {"status": "error", "message": f"Series ID {series_id} not found."}
+    series_name = series[0]["name"]
+
+    # Get current state
+    current = backend.query_db("""
+        SELECT b.id, b.title, b.series_index
+        FROM books b
+        JOIN books_series_link bsl ON b.id = bsl.book
+        WHERE bsl.series = ?
+        ORDER BY b.series_index
+    """, (series_id,))
+
+    current_map = {b["id"]: b for b in current}
+
+    changes = []
+    for a in assignments:
+        book_id = a["book_id"]
+        new_index = a["index"]
+        if book_id in current_map:
+            old_index = current_map[book_id]["series_index"]
+            if old_index != new_index:
+                changes.append({
+                    "book_id": book_id,
+                    "title": current_map[book_id]["title"],
+                    "old_index": old_index,
+                    "new_index": new_index,
+                })
+
+    if dry_run:
+        return {
+            "status": "dry_run",
+            "series": series_name,
+            "current_books": current,
+            "changes": changes,
+            "message": f"Would update {len(changes)} book(s) in '{series_name}'. Set dry_run=false to execute.",
+        }
+
+    # ── Apply via direct SQLite (calibredb times out on large libraries) ────
+    db_path = str(backend.db_path)
+    try:
+        conn = sqlite3.connect(db_path, timeout=30)
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("BEGIN")
+        for ch in changes:
+            conn.execute(
+                "UPDATE books SET series_index=? WHERE id=?",
+                (ch["new_index"], ch["book_id"]),
+            )
+        conn.execute("COMMIT")
+        conn.close()
+    except Exception as exc:
+        try:
+            conn.execute("ROLLBACK")
+            conn.close()
+        except Exception:
+            pass
+        return {"status": "error", "message": str(exc), "series": series_name}
+
+    return {
+        "status": "completed",
+        "series": series_name,
+        "updated": len(changes),
+        "errors": [],
+    }
+
+
+def rename_author(
+    backend,
+    author_id: int,
+    new_name: str,
+    new_sort: str | None = None,
+    dry_run: bool = True,
+) -> dict[str, Any]:
+    """
+    Rename an author directly in the database, bypassing calibredb's
+    case-insensitive author matching (which prevents case-only renames like
+    BOECIO → Boecio).
+
+    This does a direct SQL UPDATE on the authors table — no books are
+    re-linked, only the author's name and sort fields change.
+
+    Args:
+        author_id: ID of the author to rename
+        new_name:  New display name (e.g. "Boecio" instead of "BOECIO")
+        new_sort:  New sort key. Defaults to new_name if omitted.
+        dry_run:   If True, only show what would change
+    """
+    if new_sort is None:
+        new_sort = new_name
+
+    current = backend.query_db(
+        "SELECT id, name, sort FROM authors WHERE id = ?", (author_id,)
+    )
+    if not current:
+        return {"status": "error", "message": f"Author ID {author_id} not found."}
+    current = current[0]
+
+    if dry_run:
+        return {
+            "status": "dry_run",
+            "author_id": author_id,
+            "old_name": current["name"],
+            "old_sort": current["sort"],
+            "new_name": new_name,
+            "new_sort": new_sort,
+            "message": (
+                f"Would rename '{current['name']}' → '{new_name}' "
+                f"(sort: '{new_sort}'). Set dry_run=false to execute."
+            ),
+        }
+
+    db_path = str(backend.db_path)
+    try:
+        conn = sqlite3.connect(db_path, timeout=15)
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("BEGIN")
+
+        conn.execute(
+            "UPDATE authors SET name=?, sort=? WHERE id=?",
+            (new_name, new_sort, author_id),
+        )
+        # Refresh the denormalised author_sort on all books by this author
+        conn.execute(
+            "UPDATE books SET author_sort=? "
+            "WHERE id IN (SELECT book FROM books_authors_link WHERE author=?)",
+            (new_sort, author_id),
+        )
+
+        conn.execute("COMMIT")
+        conn.close()
+    except Exception as exc:
+        try:
+            conn.execute("ROLLBACK")
+            conn.close()
+        except Exception:
+            pass
+        return {"status": "error", "message": str(exc)}
+
+    # Check if any affected books have multiple authors
+    multi_author_books = backend.query_db("""
+        SELECT b.id, b.title
+        FROM books_authors_link bal
+        JOIN books b ON b.id = bal.book
+        WHERE bal.author = ?
+          AND (SELECT COUNT(*) FROM books_authors_link bal2 WHERE bal2.book = b.id) > 1
+    """, (author_id,))
+
+    result = {
+        "status": "completed",
+        "author_id": author_id,
+        "old_name": current["name"],
+        "new_name": new_name,
+        "new_sort": new_sort,
+    }
+
+    if multi_author_books:
+        result["warning"] = (
+            f"{len(multi_author_books)} book(s) have multiple authors. "
+            f"Run fix_author_sort to correct their author_sort field."
+        )
+        result["multi_author_book_ids"] = [b["id"] for b in multi_author_books]
+
+    return result
+
+
+def fix_author_sort(
+    backend,
+    limit: int = 100,
+    dry_run: bool = True,
+) -> dict[str, Any]:
+    """
+    Synchronize books.author_sort with the actual linked author's sort field.
+    Fixes cases where author_sort is stale after author merges.
+
+    Instead of using GROUP_CONCAT (non-deterministic order), we query each book's
+    authors individually and build the correct sort string in Python with consistent
+    ordering by the link table's id column.
+    """
+    # Get all books that have authors linked
+    all_books = backend.query_db("""
+        SELECT b.id, b.title, b.author_sort
+        FROM books b
+        WHERE EXISTS (SELECT 1 FROM books_authors_link bal WHERE bal.book = b.id)
+        LIMIT ?
+    """, (limit * 10,))  # Fetch more than limit since most won't be mismatches
+
+    mismatches = []
+    for book in all_books:
+        # Get authors in consistent order (by link table id = insertion order)
+        authors = backend.query_db("""
+            SELECT a.name, a.sort FROM books_authors_link bal
+            JOIN authors a ON bal.author = a.id
+            WHERE bal.book = ?
+            ORDER BY bal.id
+        """, (book["id"],))
+
+        if not authors:
+            continue
+
+        correct_sort = " & ".join(a["sort"] for a in authors)
+        if book["author_sort"] != correct_sort:
+            mismatches.append({
+                "id": book["id"],
+                "title": book["title"],
+                "current": book["author_sort"],
+                "correct": correct_sort,
+                "author_names": [a["name"] for a in authors],
+            })
+            if len(mismatches) >= limit:
+                break
+
+    if dry_run:
+        return {
+            "status": "dry_run",
+            "mismatches": [
+                {"id": m["id"], "title": m["title"],
+                 "current": m["current"], "correct": m["correct"]}
+                for m in mismatches
+            ],
+            "total": len(mismatches),
+            "message": f"Found {len(mismatches)} book(s) with stale author_sort. Set dry_run=false to fix.",
+        }
+
+    # ── Apply via direct SQLite (calibredb times out on large libraries) ────
+    db_path = str(backend.db_path)
+    try:
+        conn = sqlite3.connect(db_path, timeout=30)
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("BEGIN")
+        for m in mismatches:
+            conn.execute(
+                "UPDATE books SET author_sort=? WHERE id=?",
+                (m["correct"], m["id"]),
+            )
+        conn.execute("COMMIT")
+        conn.close()
+    except Exception as exc:
+        try:
+            conn.execute("ROLLBACK")
+            conn.close()
+        except Exception:
+            pass
+        return {"status": "error", "message": str(exc)}
+
+    return {
+        "status": "completed",
+        "fixed": len(mismatches),
+        "errors": [],
+    }
+
+
+def cleanup_orphan_links(
+    backend,
+    dry_run: bool = True,
+) -> dict[str, Any]:
+    """
+    Remove orphan entries from link tables where the book ID no longer exists.
+    This prevents FK constraint errors in Calibre operations.
+
+    WARNING: This writes directly to SQLite. Only use when Calibre is closed.
+    """
+    link_tables = [
+        ("books_authors_link", "book"),
+        ("books_series_link", "book"),
+        ("books_tags_link", "book"),
+        ("books_publishers_link", "book"),
+        ("books_languages_link", "book"),
+        ("data", "book"),
+        ("comments", "book"),
+        ("identifiers", "book"),
+    ]
+
+    # Count orphans
+    counts = {}
+    for table, col in link_tables:
+        count = backend.query_db_scalar(f"""
+            SELECT COUNT(*) FROM {table} t
+            WHERE NOT EXISTS (SELECT 1 FROM books b WHERE b.id = t.{col})
+        """)
+        if count and count > 0:
+            counts[table] = count
+
+    if dry_run:
+        return {
+            "status": "dry_run",
+            "orphan_counts": counts,
+            "total": sum(counts.values()),
+            "message": f"Found {sum(counts.values())} orphan link(s). Set dry_run=false to clean.",
+        }
+
+    if not counts:
+        return {"status": "no_action", "message": "No orphan links found."}
+
+    # Direct SQLite write (dangerous but necessary — calibredb has no tool for this)
+    try:
+        conn = sqlite3.connect(str(backend.db_path), timeout=10)
+        conn.execute("PRAGMA journal_mode=WAL")
+        deleted = {}
+        for table, col in link_tables:
+            if table in counts:
+                cursor = conn.execute(f"""
+                    DELETE FROM {table}
+                    WHERE NOT EXISTS (SELECT 1 FROM books b WHERE b.id = {table}.{col})
+                """)
+                deleted[table] = cursor.rowcount
+        conn.commit()
+        conn.close()
+
+        return {
+            "status": "completed",
+            "deleted": deleted,
+            "total": sum(deleted.values()),
+        }
+    except sqlite3.OperationalError as e:
+        return {"status": "error", "message": f"SQLite write failed (is Calibre open?): {e}"}
