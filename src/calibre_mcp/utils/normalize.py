@@ -11,8 +11,10 @@ def normalize_for_grouping(name: str) -> str:
     'Stephen King' and 'King, Stephen' produce the same key.
     """
     s = name.lower().strip()
+    # Strip apostrophes without inserting a space (O'Brien → OBrien, not O Brien)
+    s = re.sub(r"'", '', s)
     # Remove quotes, brackets, parens
-    s = re.sub(r'[«»"\'\(\)\[\]]+', ' ', s)
+    s = re.sub(r'[«»"\(\)\[\]]+', ' ', s)
     # Decompose unicode and strip combining marks (accents)
     s = unicodedata.normalize('NFKD', s)
     s = ''.join(ch for ch in s if not unicodedata.combining(ch))
