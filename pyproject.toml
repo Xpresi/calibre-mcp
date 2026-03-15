@@ -1,0 +1,15 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "calibre-mcp"
+version = "0.2.0"
+description = "MCP Server for managing a Calibre ebook library"
+requires-python = ">=3.10"
+dependencies = [
+    "mcp[cli]>=1.0.0",
+]
+
+[project.scripts]
+calibre-mcp = "calibre_mcp.server:main"
