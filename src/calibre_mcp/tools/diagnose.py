@@ -255,7 +255,7 @@ def find_uppercase_items(
 ) -> dict[str, list[dict[str, Any]]]:
     """
     Find items that are ALL UPPERCASE.
-    item_type: 'titles', 'authors', 'tags', 'publishers', or 'all'
+    item_type: 'titles', 'authors', 'tags', 'publishers', 'series', or 'all'
     """
     results = {}
 
@@ -291,6 +291,17 @@ def find_uppercase_items(
             GROUP BY p.id
         """)
         results["publishers"] = [
+            {"id": r["id"], "name": r["name"], "book_count": r["book_count"]}
+            for r in rows if is_all_uppercase(r["name"])
+        ][:limit]
+
+    if item_type in ("all", "series"):
+        rows = backend.query_db("""
+            SELECT s.id, s.name, COUNT(bsl.book) as book_count
+            FROM series s LEFT JOIN books_series_link bsl ON s.id = bsl.series
+            GROUP BY s.id
+        """)
+        results["series"] = [
             {"id": r["id"], "name": r["name"], "book_count": r["book_count"]}
             for r in rows if is_all_uppercase(r["name"])
         ][:limit]

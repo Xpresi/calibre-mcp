@@ -2,16 +2,31 @@
 
 import json
 import os
+import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 
 
+def _default_calibredb_path() -> str:
+    """Return the most likely calibredb path for the current platform."""
+    if sys.platform == "win32":
+        return r"C:\Program Files\Calibre2\calibredb.exe"
+    elif sys.platform == "darwin":
+        return "/Applications/calibre.app/Contents/MacOS/calibredb"
+    else:
+        return "/usr/bin/calibredb"
+
+
 @dataclass
 class Config:
-    calibredb_path: str = r"C:\Program Files\Calibre2\calibredb.exe"
+    calibredb_path: str = ""
     library_path: str = ""
     backup_before_bulk_ops: bool = True
     dry_run_by_default: bool = True
+
+    def __post_init__(self):
+        if not self.calibredb_path:
+            self.calibredb_path = _default_calibredb_path()
 
     @classmethod
     def load(cls, config_path: str | Path | None = None) -> "Config":

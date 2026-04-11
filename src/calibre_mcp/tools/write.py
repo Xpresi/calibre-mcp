@@ -28,10 +28,9 @@ def _set_metadata_sqlite(backend, book_id: int, fields: dict) -> dict:
     Much faster than calibredb for large libraries (no library scan).
     Handles: title, authors, series, series_index, publisher.
     """
-    db_path = str(backend.db_path)
-    conn = sqlite3.connect(db_path, timeout=15)
     try:
-        conn.execute("PRAGMA journal_mode=WAL")
+
+        conn = backend.connect_write(timeout=15)
         conn.execute("BEGIN")
         changed = []
 
@@ -246,8 +245,7 @@ def _remove_books_sqlite(backend, books: list[dict]) -> list[dict]:
     import shutil
 
     library_path = Path(backend.config.library_path)
-    db_path = str(backend.db_path)
-    conn = sqlite3.connect(db_path, timeout=15)
+    conn = backend.connect_write(timeout=15)
     removed = []
 
     try:

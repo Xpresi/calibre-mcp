@@ -205,11 +205,11 @@ TOOLS = [
     ),
     Tool(
         name="find_uppercase_items",
-        description="Find titles, authors, tags, or publishers in ALL UPPERCASE.",
+        description="Find titles, authors, tags, publishers, or series in ALL UPPERCASE.",
         inputSchema={
             "type": "object",
             "properties": {
-                "item_type": {"type": "string", "enum": ["all", "titles", "authors", "tags", "publishers"], "default": "all"},
+                "item_type": {"type": "string", "enum": ["all", "titles", "authors", "tags", "publishers", "series"], "default": "all"},
                 "limit": {"type": "integer", "default": 100},
             },
         },
@@ -426,11 +426,11 @@ TOOLS = [
     ),
     Tool(
         name="normalize_uppercase",
-        description="Convert ALL UPPERCASE titles/tags/publishers to Title Case (smart, with Spanish/English particles and acronym handling). Dry-run by default.",
+        description="Convert ALL UPPERCASE titles/tags/publishers/series to Title Case (smart, with Spanish/English particles and acronym handling). For series: automatically merges into existing series if normalized name conflicts. Dry-run by default.",
         inputSchema={
             "type": "object",
             "properties": {
-                "item_type": {"type": "string", "enum": ["titles", "tags", "publishers"]},
+                "item_type": {"type": "string", "enum": ["titles", "tags", "publishers", "series"]},
                 "limit": {"type": "integer", "default": 100},
                 "dry_run": {"type": "boolean", "default": True},
             },

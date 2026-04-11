@@ -106,12 +106,10 @@ def fix_book_paths(
     # Apply fixes — use incremental commits (COMMIT_EVERY books) so that partial
     # progress is preserved if the MCP call is cancelled (e.g. client-side timeout).
     COMMIT_EVERY = 1000
-    db_path = str(backend.db_path)
-    conn = sqlite3.connect(db_path, timeout=15)
+    conn = backend.connect_write(timeout=15)
     applied, errors = [], []
 
     try:
-        conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("BEGIN")
         pending_in_txn = 0
 
@@ -265,8 +263,7 @@ def merge_authors(
     db_path = str(backend.db_path)
     errors = []
     try:
-        conn = sqlite3.connect(db_path, timeout=30)
-        conn.execute("PRAGMA journal_mode=WAL")
+        conn = backend.connect_write(timeout=30)
         conn.execute("BEGIN")
 
         for book in affected_books:
@@ -418,8 +415,34 @@ def normalize_uppercase(
                     })
                     if len(changes) >= limit:
                         break
+
+    elif item_type == "series":
+        rows = backend.query_db("""
+            SELECT s.id, s.name, COUNT(bsl.book) as book_count
+            FROM series s LEFT JOIN books_series_link bsl ON s.id = bsl.series
+            GROUP BY s.id
+        """)
+        # Build a name->id map to detect conflicts (new name matches existing series)
+        all_series = backend.query_db("SELECT id, name FROM series")
+        name_to_id = {r["name"].lower(): r["id"] for r in all_series}
+        for r in rows:
+            if is_all_uppercase(r["name"]):
+                new_name = smart_title_case(r["name"])
+                if new_name != r["name"]:
+                    existing_id = name_to_id.get(new_name.lower())
+                    conflict_id = existing_id if existing_id and existing_id != r["id"] else None
+                    changes.append({
+                        "id": r["id"],
+                        "old": r["name"],
+                        "new": new_name,
+                        "book_count": r["book_count"],
+                        "conflict_id": conflict_id,
+                    })
+                    if len(changes) >= limit:
+                        break
+
     else:
-        return {"status": "error", "message": f"Unknown item_type: {item_type}. Use 'titles', 'tags', or 'publishers'."}
+        return {"status": "error", "message": f"Unknown item_type: {item_type}. Use 'titles', 'tags', 'publishers', or 'series'."}
 
     if dry_run:
         return {
@@ -436,8 +459,7 @@ def normalize_uppercase(
     # ── Apply via direct SQLite (calibredb times out on large libraries) ────
     db_path = str(backend.db_path)
     try:
-        conn = sqlite3.connect(db_path, timeout=30)
-        conn.execute("PRAGMA journal_mode=WAL")
+        conn = backend.connect_write(timeout=30)
         conn.execute("BEGIN")
 
         if item_type == "titles":
@@ -464,6 +486,23 @@ def normalize_uppercase(
                     (ch["new"], ch["id"]),
                 )
 
+        elif item_type == "series":
+            merges = 0
+            for ch in changes:
+                if ch["conflict_id"]:
+                    # Merge: move all books to existing series, delete old
+                    conn.execute(
+                        "UPDATE books_series_link SET series=? WHERE series=?",
+                        (ch["conflict_id"], ch["id"]),
+                    )
+                    conn.execute("DELETE FROM series WHERE id=?", (ch["id"],))
+                    merges += 1
+                else:
+                    conn.execute(
+                        "UPDATE series SET name=?, sort=? WHERE id=?",
+                        (ch["new"], ch["new"], ch["id"]),
+                    )
+
         conn.execute("COMMIT")
         conn.close()
     except Exception as exc:
@@ -474,13 +513,19 @@ def normalize_uppercase(
             pass
         return {"status": "error", "message": str(exc)}
 
-    return {
+    result = {
         "status": "completed",
         "item_type": item_type,
         "total_changes": len(changes),
         "successful": len(changes),
         "errors": [],
     }
+    if item_type == "series":
+        conflicts = [ch for ch in changes if ch["conflict_id"]]
+        if conflicts:
+            result["merges"] = len(conflicts)
+            result["merged"] = [{"old": ch["old"], "merged_into_id": ch["conflict_id"]} for ch in conflicts]
+    return result
 
 
 def fix_series_numbers(
@@ -540,8 +585,7 @@ def fix_series_numbers(
     # ── Apply via direct SQLite (calibredb times out on large libraries) ────
     db_path = str(backend.db_path)
     try:
-        conn = sqlite3.connect(db_path, timeout=30)
-        conn.execute("PRAGMA journal_mode=WAL")
+        conn = backend.connect_write(timeout=30)
         conn.execute("BEGIN")
         for ch in changes:
             conn.execute(
@@ -613,8 +657,7 @@ def rename_author(
 
     db_path = str(backend.db_path)
     try:
-        conn = sqlite3.connect(db_path, timeout=15)
-        conn.execute("PRAGMA journal_mode=WAL")
+        conn = backend.connect_write(timeout=15)
         conn.execute("BEGIN")
 
         conn.execute(
@@ -726,8 +769,7 @@ def fix_author_sort(
     # ── Apply via direct SQLite (calibredb times out on large libraries) ────
     db_path = str(backend.db_path)
     try:
-        conn = sqlite3.connect(db_path, timeout=30)
-        conn.execute("PRAGMA journal_mode=WAL")
+        conn = backend.connect_write(timeout=30)
         conn.execute("BEGIN")
         for m in mismatches:
             conn.execute(
@@ -795,8 +837,7 @@ def cleanup_orphan_links(
 
     # Direct SQLite write (dangerous but necessary — calibredb has no tool for this)
     try:
-        conn = sqlite3.connect(str(backend.db_path), timeout=10)
-        conn.execute("PRAGMA journal_mode=WAL")
+        conn = backend.connect_write(timeout=10)
         deleted = {}
         for table, col in link_tables:
             if table in counts:

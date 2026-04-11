@@ -5,6 +5,7 @@ import logging
 import shutil
 import sqlite3
 import subprocess
+import sys
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -125,6 +126,50 @@ class CalibreBackend:
             first_key = next(iter(rows[0]))
             return rows[0][first_key]
         return None
+
+    # ── Calibre process detection ──────────────────────────────────────
+
+    def is_calibre_running(self) -> bool:
+        """Return True if the Calibre GUI process is currently running."""
+        try:
+            if sys.platform == "win32":
+                # Use shell=True so cmd.exe handles the /FI flag correctly
+                # regardless of whether we're running under Git bash or cmd.
+                result = subprocess.run(
+                    'tasklist /FI "IMAGENAME eq calibre.exe" /NH',
+                    shell=True,
+                    capture_output=True, text=True, timeout=5,
+                )
+                return "calibre.exe" in result.stdout.lower()
+            else:
+                # Linux / macOS
+                result = subprocess.run(
+                    ["pgrep", "-x", "calibre"],
+                    capture_output=True, timeout=5,
+                )
+                return result.returncode == 0
+        except Exception:
+            return False  # Can't check → assume closed, let SQLite catch real locks
+
+    def require_calibre_closed(self) -> None:
+        """Raise CalibreError if the Calibre GUI is open."""
+        if self.is_calibre_running():
+            raise CalibreError(
+                "Calibre is currently open. Close it before running write operations "
+                "that access the database directly."
+            )
+
+    def connect_write(self, timeout: int = 30) -> sqlite3.Connection:
+        """
+        Open a writable SQLite connection to metadata.db.
+
+        Verifies Calibre is closed first, then opens the connection in WAL mode.
+        Use this instead of sqlite3.connect() for all direct write operations.
+        """
+        self.require_calibre_closed()
+        conn = sqlite3.connect(str(self.db_path), timeout=timeout)
+        conn.execute("PRAGMA journal_mode=WAL")
+        return conn
 
     # ── Utility methods ────────────────────────────────────────────────
 
