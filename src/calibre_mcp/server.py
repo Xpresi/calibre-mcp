@@ -12,6 +12,85 @@ from .backend import CalibreBackend, CalibreError
 from .config import Config
 from .tools import query, diagnose, write, bulk, report
 
+
+# ── Schema helpers ─────────────────────────────────────────────────────
+
+def _permissive_prop(prop: dict) -> dict:
+    """Allow string representation in addition to the declared type.
+    Needed because Claude Code's MCP client sends all XML parameter values
+    as strings; the client-side Zod validator would otherwise reject them."""
+    t = prop.get("type")
+    if t in ("integer", "number", "boolean"):
+        p = {k: v for k, v in prop.items() if k != "type"}
+        p["anyOf"] = [{"type": t}, {"type": "string"}]
+        return p
+    if t == "array":
+        p = {k: v for k, v in prop.items() if k not in ("type", "items")}
+        array_schema = {"type": "array"}
+        if "items" in prop:
+            array_schema["items"] = prop["items"]
+        p["anyOf"] = [array_schema, {"type": "string"}]
+        return p
+    if t == "object":
+        p = {k: v for k, v in prop.items() if k != "type"}
+        p["anyOf"] = [{"type": "object"}, {"type": "string"}]
+        return p
+    return prop
+
+
+def _permissive(schema: dict) -> dict:
+    """Recursively relax a tool inputSchema so typed fields also accept strings."""
+    if "properties" not in schema:
+        return schema
+    return {**schema, "properties": {k: _permissive_prop(v) for k, v in schema["properties"].items()}}
+
+
+# ── Argument coercion ──────────────────────────────────────────────────
+
+def _coerce(name: str, args: dict[str, Any]) -> dict[str, Any]:
+    """Convert string arguments to the proper Python types expected by handlers.
+    Mirrors the schema relaxation done in _permissive_prop."""
+    tool = next((t for t in TOOLS if t.name == name), None)
+    if not tool:
+        return args
+    props = tool.inputSchema.get("properties", {})
+    out = dict(args)
+    for key, value in args.items():
+        if not isinstance(value, str):
+            continue
+        # Look at anyOf to find the intended non-string type
+        prop = props.get(key, {})
+        intended = None
+        for alt in prop.get("anyOf", []):
+            if alt.get("type") != "string":
+                intended = alt.get("type")
+                break
+        if intended is None:
+            intended = prop.get("type")  # fallback for non-permissive props
+        if intended == "integer":
+            try:
+                out[key] = int(value)
+            except (ValueError, TypeError):
+                pass
+        elif intended == "number":
+            try:
+                out[key] = float(value)
+            except (ValueError, TypeError):
+                pass
+        elif intended == "boolean":
+            out[key] = value.lower() in ("true", "yes", "1")
+        elif intended == "array":
+            try:
+                out[key] = json.loads(value)
+            except (json.JSONDecodeError, TypeError):
+                pass
+        elif intended == "object":
+            try:
+                out[key] = json.loads(value)
+            except (json.JSONDecodeError, TypeError):
+                pass
+    return out
+
 # ── Logging ────────────────────────────────────────────────────────────
 
 logging.basicConfig(
@@ -536,6 +615,12 @@ TOOLS = [
     ),
 ]
 
+# Apply permissive schemas so Claude Code's client accepts string-typed params
+TOOLS = [
+    Tool(name=t.name, description=t.description, inputSchema=_permissive(t.inputSchema))
+    for t in TOOLS
+]
+
 
 # ── Tool listing ───────────────────────────────────────────────────────
 
@@ -548,6 +633,7 @@ async def list_tools() -> list[Tool]:
 
 @server.call_tool()
 async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
+    arguments = _coerce(name, arguments)
     try:
         match name:
             # Stats
