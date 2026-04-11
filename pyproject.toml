@@ -25,8 +25,8 @@ dependencies = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/yourusername/calibre-mcp"
-Issues = "https://github.com/yourusername/calibre-mcp/issues"
+Homepage = "https://github.com/Xpresi/calibre-mcp"
+Issues = "https://github.com/Xpresi/calibre-mcp/issues"
 
 [project.scripts]
 calibre-mcp = "calibre_mcp.server:main"
