@@ -374,9 +374,13 @@ def raw_sql_query(
             ),
         }
 
-    # Block dangerous keywords even inside SELECT (e.g. SELECT ... INTO)
+    # Block dangerous keywords even inside SELECT (e.g. SELECT ... INTO).
+    # REPLACE is allowed when used as a string function (REPLACE(...)) but not
+    # as a DML statement (REPLACE INTO ...). Use a negative lookahead to allow
+    # the function form.
     blocked = re.compile(
-        r"\b(INSERT|UPDATE|DELETE|DROP|CREATE|ALTER|ATTACH|DETACH|REPLACE|PRAGMA)\b",
+        r"\b(INSERT|UPDATE|DELETE|DROP|CREATE|ALTER|ATTACH|DETACH|PRAGMA)\b"
+        r"|\bREPLACE\s*(?!\s*\()",
         re.IGNORECASE,
     )
     if blocked.search(normalized):

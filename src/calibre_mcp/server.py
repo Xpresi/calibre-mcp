@@ -679,9 +679,13 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
 
             # Write operations
             case "remove_books":
-                return _json_response(write.remove_books(backend, **arguments))
+                result = write.remove_books(backend, **arguments)
+                backend.log_operation(name, arguments, result)
+                return _json_response(result)
             case "set_book_metadata":
-                return _json_response(write.set_book_metadata(backend, **arguments))
+                result = write.set_book_metadata(backend, **arguments)
+                backend.log_operation(name, arguments, result)
+                return _json_response(result)
             case "backup_database":
                 return _json_response(write.backup_database(backend, **arguments))
             case "vacuum_database":
@@ -701,21 +705,37 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
 
             # Bulk
             case "rename_author":
-                return _json_response(bulk.rename_author(backend, **arguments))
+                result = bulk.rename_author(backend, **arguments)
+                backend.log_operation(name, arguments, result)
+                return _json_response(result)
             case "bulk_set_metadata":
-                return _json_response(write.bulk_set_metadata(backend, **arguments))
+                result = write.bulk_set_metadata(backend, **arguments)
+                backend.log_operation(name, arguments, result)
+                return _json_response(result)
             case "merge_authors":
-                return _json_response(bulk.merge_authors(backend, **arguments))
+                result = bulk.merge_authors(backend, **arguments)
+                backend.log_operation(name, arguments, result)
+                return _json_response(result)
             case "normalize_uppercase":
-                return _json_response(bulk.normalize_uppercase(backend, **arguments))
+                result = bulk.normalize_uppercase(backend, **arguments)
+                backend.log_operation(name, arguments, result)
+                return _json_response(result)
             case "fix_series_numbers":
-                return _json_response(bulk.fix_series_numbers(backend, **arguments))
+                result = bulk.fix_series_numbers(backend, **arguments)
+                backend.log_operation(name, arguments, result)
+                return _json_response(result)
             case "fix_author_sort":
-                return _json_response(bulk.fix_author_sort(backend, **arguments))
+                result = bulk.fix_author_sort(backend, **arguments)
+                backend.log_operation(name, arguments, result)
+                return _json_response(result)
             case "cleanup_orphan_links":
-                return _json_response(bulk.cleanup_orphan_links(backend, **arguments))
+                result = bulk.cleanup_orphan_links(backend, **arguments)
+                backend.log_operation(name, arguments, result)
+                return _json_response(result)
             case "fix_book_paths":
-                return _json_response(bulk.fix_book_paths(backend, **arguments))
+                result = bulk.fix_book_paths(backend, **arguments)
+                backend.log_operation(name, arguments, result)
+                return _json_response(result)
 
             # Report
             case "fetch_metadata":

@@ -282,17 +282,83 @@ def _remove_books_sqlite(backend, books: list[dict]) -> list[dict]:
                 "id": book_id,
                 "title": book["title"],
                 "author_sort": book["author_sort"],
-                "path": book["path"],
             })
 
         conn.execute("COMMIT")
+
+        # Check for orphans, warn if suspicious, then clean
+        orphan_result = _cleanup_orphans(conn, len(books))
+
     except Exception as exc:
         conn.execute("ROLLBACK")
         raise exc
     finally:
         conn.close()
 
-    return removed
+    return removed, orphan_result
+
+
+def _cleanup_orphans(conn: "sqlite3.Connection", books_removed: int) -> dict:
+    """
+    Detect and delete orphaned rows from series/authors/tags/publishers.
+
+    First counts orphans per table. If any table has more orphans than the number
+    of books removed (a conservative upper bound), skips deletion and returns a
+    warning so the caller can decide — orphans are listed but NOT deleted.
+
+    Otherwise deletes them and returns a summary.
+    """
+    TABLES = [
+        ("series",     "series",    "books_series_link"),
+        ("authors",    "author",    "books_authors_link"),
+        ("tags",       "tag",       "books_tags_link"),
+        ("publishers", "publisher", "books_publishers_link"),
+    ]
+
+    counts: dict[str, list] = {}
+    for table, link_col, link_table in TABLES:
+        rows = conn.execute(
+            f"SELECT name FROM {table} "
+            f"WHERE id NOT IN (SELECT {link_col} FROM {link_table})"
+        ).fetchall()
+        counts[table] = [r[0] for r in rows]
+
+    # Warn if any table has suspiciously many orphans
+    suspicious = {
+        table: names
+        for table, names in counts.items()
+        if len(names) > books_removed
+    }
+    if suspicious:
+        summary = {table: len(names) for table, names in counts.items()}
+        return {
+            "status": "skipped",
+            "reason": (
+                f"Orphan count exceeds books removed ({books_removed}). "
+                "Cleanup skipped — review manually."
+            ),
+            "orphans_found": {
+                table: names for table, names in suspicious.items()
+            },
+            "counts": summary,
+        }
+
+    # Safe to clean
+    cleaned: dict[str, int] = {}
+    for table, link_col, link_table in TABLES:
+        count = len(counts[table])
+        if count:
+            conn.execute(
+                f"DELETE FROM {table} WHERE id NOT IN (SELECT {link_col} FROM {link_table})"
+            )
+        cleaned[table] = count
+
+    conn.commit()
+    return {
+        "status": "cleaned",
+        "cleaned": cleaned,
+        "total": sum(cleaned.values()),
+    }
 
 
 def remove_books(
@@ -333,12 +399,13 @@ def remove_books(
 
     # Execute removal via direct SQLite + filesystem (avoids calibredb timeout)
     try:
-        removed = _remove_books_sqlite(backend, books)
+        removed, orphan_result = _remove_books_sqlite(backend, books)
         logger.info(f"Removed books: {[b['id'] for b in books]}")
         return {
             "status": "success",
             "removed": removed,
             "missing_ids": missing_ids,
+            "orphans_cleaned": orphan_result,
         }
     except Exception as e:
         return {"status": "error", "message": str(e)}

@@ -159,6 +159,26 @@ class CalibreBackend:
                 "that access the database directly."
             )
 
+    def log_operation(
+        self,
+        tool: str,
+        args: dict[str, Any],
+        result: Any = None,
+    ) -> None:
+        """Append a structured entry to the operations log (JSONL)."""
+        entry = {
+            "timestamp": datetime.now().isoformat(timespec="seconds"),
+            "tool": tool,
+            "args": args,
+            "result": result,
+        }
+        try:
+            log_path = self.config.operations_log_path
+            with open(log_path, "a", encoding="utf-8") as f:
+                f.write(json.dumps(entry, ensure_ascii=False, default=str) + "\n")
+        except Exception as e:
+            logger.warning(f"Failed to write operations log: {e}")
+
     def connect_write(self, timeout: int = 30) -> sqlite3.Connection:
         """
         Open a writable SQLite connection to metadata.db.

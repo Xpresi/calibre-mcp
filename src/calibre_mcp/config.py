@@ -23,6 +23,7 @@ class Config:
     library_path: str = ""
     backup_before_bulk_ops: bool = True
     dry_run_by_default: bool = True
+    operations_log: str = ""  # Path to JSONL operations log; defaults to <library>/calibre_operations.jsonl
 
     def __post_init__(self):
         if not self.calibredb_path:
@@ -52,6 +53,12 @@ class Config:
     @property
     def metadata_db_path(self) -> Path:
         return Path(self.library_path) / "metadata.db"
+
+    @property
+    def operations_log_path(self) -> Path:
+        if self.operations_log:
+            return Path(self.operations_log)
+        return Path(self.library_path) / "calibre_operations.jsonl"
 
     def validate(self) -> list[str]:
         """Return list of validation errors (empty = OK)."""
