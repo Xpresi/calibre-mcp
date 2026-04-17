@@ -322,7 +322,8 @@ TOOLS = [
     Tool(
         name="find_ghost_books",
         description=(
-            "Find books in DB whose directory doesn't exist on disk. "
+            "Find books in DB whose directory or format files don't exist on disk. "
+            "Checks both missing directories AND missing format files within existing directories. "
             "Default mode does a pageable manual filesystem check (never times out). "
             "Set use_calibredb=true to use calibredb check_library instead (may time out on large libraries)."
         ),
@@ -332,6 +333,26 @@ TOOLS = [
                 "use_calibredb": {"type": "boolean", "default": False, "description": "Use calibredb check_library instead of manual scan"},
                 "limit":  {"type": "integer", "default": 100, "description": "Books to check per call"},
                 "offset": {"type": "integer", "default": 0,   "description": "Skip this many books (for pagination)"},
+            },
+        },
+    ),
+    Tool(
+        name="verify_file_integrity",
+        description=(
+            "Verify that every format file referenced in the DB exists on disk. "
+            "Run this after any rename operation (normalize_uppercase, rename_author, merge_authors, "
+            "bulk_set_metadata with title/author) to confirm no files were lost. "
+            "Returns ok=true if all files are present, ok=false with a list of missing files otherwise. "
+            "Pass book_ids to check only specific books (fast); omit to check all books (may take minutes)."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "book_ids": {
+                    "type": "array",
+                    "items": {"type": "integer"},
+                    "description": "Optional list of book IDs to check. If omitted, checks all books.",
+                },
             },
         },
     ),
@@ -551,6 +572,21 @@ TOOLS = [
         },
     ),
     Tool(
+        name="find_orphaned_metadata",
+        description=(
+            "Find (and optionally delete) orphaned rows in authors, series, tags, and publishers — "
+            "entries that no longer have any books linked to them. "
+            "These accumulate after remove_books, merge_authors, or bulk deletions. "
+            "Dry-run by default: lists orphans without deleting. Set dry_run=false to clean them up."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "dry_run": {"type": "boolean", "default": True},
+            },
+        },
+    ),
+    Tool(
         name="cleanup_orphan_links",
         description="Remove orphan entries from link tables where book ID no longer exists. Direct SQLite write — requires Calibre closed. Dry-run by default.",
         inputSchema={
@@ -676,6 +712,8 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
                 return _json_response(diagnose.find_orphan_files(backend, **arguments))
             case "find_ghost_books":
                 return _json_response(diagnose.find_ghost_books(backend, **arguments))
+            case "verify_file_integrity":
+                return _json_response(diagnose.verify_file_integrity(backend, **arguments))
 
             # Write operations
             case "remove_books":
@@ -726,6 +764,10 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
                 return _json_response(result)
             case "fix_author_sort":
                 result = bulk.fix_author_sort(backend, **arguments)
+                backend.log_operation(name, arguments, result)
+                return _json_response(result)
+            case "find_orphaned_metadata":
+                result = bulk.find_orphaned_metadata(backend, **arguments)
                 backend.log_operation(name, arguments, result)
                 return _json_response(result)
             case "cleanup_orphan_links":

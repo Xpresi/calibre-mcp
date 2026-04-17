@@ -460,7 +460,11 @@ def find_ghost_books(
     offset: int = 0,
 ) -> dict[str, Any]:
     """
-    Find books in the DB whose directory doesn't exist on disk.
+    Find books in the DB whose directory or format files don't exist on disk.
+
+    Checks both:
+    - Missing directory (book_dir does not exist)
+    - Missing format files (directory exists but one or more .epub/.fb2/etc. files are gone)
 
     Two modes:
     - use_calibredb=False (default): manual filesystem check — pageable,
@@ -490,21 +494,46 @@ def find_ghost_books(
     total_books = backend.query_db_scalar("SELECT COUNT(*) FROM books") or 0
 
     rows = backend.query_db("""
-        SELECT b.id, b.title, b.author_sort, b.path
-        FROM books b ORDER BY b.id
+        SELECT b.id, b.title, b.author_sort, b.path,
+               GROUP_CONCAT(d.format || ':' || d.name, '|') as formats
+        FROM books b
+        LEFT JOIN data d ON d.book = b.id
+        GROUP BY b.id
+        ORDER BY b.id
         LIMIT ? OFFSET ?
     """, (limit, offset))
 
     ghosts = []
     for r in rows:
-        book_dir = os.path.join(library_path, r["path"])
-        if not os.path.exists(book_dir):
+        book_dir = os.path.join(library_path, r["path"].replace("/", os.sep))
+        if not os.path.isdir(book_dir):
             ghosts.append({
                 "id": r["id"],
                 "title": r["title"],
                 "author_sort": r["author_sort"],
                 "expected_path": r["path"],
+                "problem": "DIR_MISSING",
             })
+            continue
+        # Directory exists — check each format file
+        if r["formats"]:
+            missing_files = []
+            for fmt_info in r["formats"].split("|"):
+                if ":" not in fmt_info:
+                    continue
+                fmt, name = fmt_info.split(":", 1)
+                filename = f"{name}.{fmt.lower()}"
+                if not os.path.exists(os.path.join(book_dir, filename)):
+                    missing_files.append(filename)
+            if missing_files:
+                ghosts.append({
+                    "id": r["id"],
+                    "title": r["title"],
+                    "author_sort": r["author_sort"],
+                    "expected_path": r["path"],
+                    "problem": "FILE_MISSING",
+                    "missing_files": missing_files,
+                })
 
     return {
         "source": "filesystem_check",
@@ -515,4 +544,74 @@ def find_ghost_books(
         "total_books": total_books,
         "has_more": (offset + len(rows)) < total_books,
         "next_offset": offset + len(rows) if (offset + len(rows)) < total_books else None,
+    }
+
+
+def verify_file_integrity(
+    backend,
+    book_ids: list[int] | None = None,
+) -> dict[str, Any]:
+    """
+    Verify that every format file referenced in the DB exists on disk.
+
+    This is the Regla 2 safety check — run after any operation that renames
+    authors, titles, or modifies book paths (normalize_uppercase, rename_author,
+    merge_authors, bulk_set_metadata with title/author fields).
+
+    Args:
+        book_ids: Optional list of book IDs to check. If omitted, checks ALL
+                  books (may take several minutes on large libraries).
+
+    Returns:
+        - ok=True with count=0 if everything is fine.
+        - ok=False with the list of missing files if any are absent.
+    """
+    library_path = backend.config.library_path
+
+    if book_ids:
+        placeholders = ",".join("?" * len(book_ids))
+        rows = backend.query_db(f"""
+            SELECT b.id, b.title, b.author_sort, b.path,
+                   d.format, d.name as file_name
+            FROM books b
+            JOIN data d ON d.book = b.id
+            WHERE b.id IN ({placeholders})
+            ORDER BY b.id
+        """, tuple(book_ids))
+    else:
+        rows = backend.query_db("""
+            SELECT b.id, b.title, b.author_sort, b.path,
+                   d.format, d.name as file_name
+            FROM books b
+            JOIN data d ON d.book = b.id
+            ORDER BY b.id
+        """)
+
+    missing = []
+    for r in rows:
+        filename = f"{r['file_name']}.{r['format'].lower()}"
+        filepath = os.path.join(
+            library_path,
+            r["path"].replace("/", os.sep),
+            filename,
+        )
+        if not os.path.exists(filepath):
+            missing.append({
+                "id": r["id"],
+                "title": r["title"],
+                "author_sort": r["author_sort"],
+                "expected_file": os.path.join(r["path"], filename),
+            })
+
+    total_checked = len(rows)
+    return {
+        "ok": len(missing) == 0,
+        "missing_count": len(missing),
+        "total_checked": total_checked,
+        "missing": missing,
+        "message": (
+            f"All {total_checked} format files present on disk."
+            if not missing
+            else f"{len(missing)} file(s) missing out of {total_checked} checked."
+        ),
     }

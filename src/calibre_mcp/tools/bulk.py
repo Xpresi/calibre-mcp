@@ -856,3 +856,73 @@ def cleanup_orphan_links(
         }
     except sqlite3.OperationalError as e:
         return {"status": "error", "message": f"SQLite write failed (is Calibre open?): {e}"}
+
+
+def find_orphaned_metadata(
+    backend,
+    dry_run: bool = True,
+) -> dict[str, Any]:
+    """
+    Find (and optionally delete) orphaned rows in authors, series, tags, and
+    publishers — i.e. entries that no longer have any books linked to them.
+
+    These accumulate after remove_books, merge_authors, or bulk deletions.
+    Unlike cleanup_orphan_links (which fixes broken link-table references),
+    this targets the metadata tables themselves.
+
+    Args:
+        dry_run: If True (default), only list orphans. If False, delete them.
+    """
+    TABLES = [
+        ("authors",    "author",    "books_authors_link"),
+        ("series",     "series",    "books_series_link"),
+        ("tags",       "tag",       "books_tags_link"),
+        ("publishers", "publisher", "books_publishers_link"),
+    ]
+
+    found: dict[str, list[str]] = {}
+    for table, link_col, link_table in TABLES:
+        rows = backend.query_db(
+            f"SELECT name FROM {table} "
+            f"WHERE id NOT IN (SELECT {link_col} FROM {link_table}) "
+            f"ORDER BY name"
+        )
+        names = [r["name"] for r in rows]
+        if names:
+            found[table] = names
+
+    total = sum(len(v) for v in found.values())
+
+    if dry_run:
+        return {
+            "status": "dry_run",
+            "orphans": found,
+            "total": total,
+            "message": (
+                f"Found {total} orphaned metadata row(s). Set dry_run=false to delete."
+                if total else "No orphaned metadata found."
+            ),
+        }
+
+    if not found:
+        return {"status": "no_action", "message": "No orphaned metadata found."}
+
+    try:
+        conn = backend.connect_write(timeout=10)
+        deleted: dict[str, int] = {}
+        for table, link_col, link_table in TABLES:
+            if table in found:
+                cursor = conn.execute(
+                    f"DELETE FROM {table} "
+                    f"WHERE id NOT IN (SELECT {link_col} FROM {link_table})"
+                )
+                deleted[table] = cursor.rowcount
+        conn.commit()
+        conn.close()
+        return {
+            "status": "completed",
+            "deleted": deleted,
+            "total": sum(deleted.values()),
+        }
+    except sqlite3.OperationalError as e:
+        return {"status": "error", "message": f"SQLite write failed (is Calibre open?): {e}"}
