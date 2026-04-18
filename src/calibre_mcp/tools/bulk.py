@@ -1,9 +1,11 @@
 """Bulk cleanup operations for the Calibre library (Hito 4)."""
 
 import logging
+import os
 import re
 import shutil
 import sqlite3
+import uuid
 from pathlib import Path
 from typing import Any
 
@@ -80,6 +82,28 @@ def fix_book_paths(
         expected_path = f"{author_dir}/{book_dir}"
 
         if current_path == expected_path:
+            # DB path matches expected — but the disk directory might have wrong
+            # casing (e.g. ALL-CAPS from a previous normalize_uppercase that only
+            # updated the DB). Check the actual directory name on disk.
+            if not dry_run:
+                disk_dir = library_path / expected_path.replace("/", os.sep)
+                parent = disk_dir.parent
+                if parent.exists():
+                    actual = next(
+                        (n for n in os.listdir(str(parent))
+                         if n.lower() == disk_dir.name.lower()),
+                        None,
+                    )
+                    if actual and actual != disk_dir.name:
+                        # Same path in DB but disk has wrong casing → needs rename
+                        fixes.append({
+                            "id":           book["id"],
+                            "title":        book["title"],
+                            "author":       book["author_name"],
+                            "current_path": current_path,
+                            "expected_path": expected_path,
+                            "_case_fix":    True,
+                        })
             continue
 
         # In dry_run skip filesystem checks (avoids thousands of disk I/Os on big libraries)
@@ -118,15 +142,40 @@ def fix_book_paths(
                 current_full  = library_path / fix["current_path"]
                 expected_full = library_path / fix["expected_path"]
 
-                # On Windows NTFS (case-insensitive), a case-only rename means source and
-                # destination point to the same physical directory.  We skip both the
-                # filesystem rename AND the exists() check (saves ~0.5 ms/book on NTFS)
-                # and just update books.path in the DB.
                 is_case_only = (
                     fix["current_path"].lower() == fix["expected_path"].lower()
                 )
 
-                if not is_case_only:
+                if is_case_only:
+                    # On Windows NTFS, source and destination are the same physical
+                    # directory when only casing differs. A direct rename() call would
+                    # be a no-op. Use a two-step rename via a temporary name so the
+                    # directory's actual casing on disk is updated.
+                    # Without this, find_orphan_files would later mistake the directory
+                    # for an orphan (case-sensitive mismatch) and could delete it.
+                    actual_dir = current_full
+                    # Find actual disk name (may differ in case from DB path)
+                    parent = actual_dir.parent
+                    actual_name = next(
+                        (n for n in os.listdir(str(parent))
+                         if n.lower() == actual_dir.name.lower()),
+                        None,
+                    )
+                    if actual_name and actual_name != expected_full.name:
+                        tmp_dir = parent / f"_casefix_{uuid.uuid4().hex}"
+                        try:
+                            os.rename(str(parent / actual_name), str(tmp_dir))
+                            os.rename(str(tmp_dir), str(expected_full))
+                            logger.info(
+                                f"Case-fixed dir: {actual_name!r} → {expected_full.name!r}"
+                            )
+                        except Exception as e:
+                            if tmp_dir.exists():
+                                os.rename(str(tmp_dir), str(parent / actual_name))
+                            errors.append({"id": fix["id"], "error": f"Case rename failed: {e}"})
+                            continue
+                    # Regardless of whether filesystem rename was needed, update DB path
+                else:
                     if current_full.exists():
                         # Ensure target parent (author dir) exists
                         expected_full.parent.mkdir(parents=True, exist_ok=True)

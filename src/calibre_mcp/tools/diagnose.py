@@ -419,12 +419,13 @@ def find_orphan_files(
 
     # Manual filesystem scan fallback
     library_path = backend.config.library_path
-    db_paths = set()
     rows = backend.query_db("SELECT path FROM books")
-    for r in rows:
-        db_paths.add(r["path"].replace("/", os.sep))
+    # Build both exact and case-folded sets for two-level comparison
+    db_paths_exact = {r["path"].replace("/", os.sep) for r in rows}
+    db_paths_lower = {p.lower() for p in db_paths_exact}
 
     orphans = []
+    case_mismatches = []
     try:
         for author_dir in os.listdir(library_path):
             author_path = os.path.join(library_path, author_dir)
@@ -435,22 +436,52 @@ def find_orphan_files(
                 full_path = os.path.join(library_path, book_path)
                 if not os.path.isdir(full_path):
                     continue
-                if book_path not in db_paths:
-                    file_count = sum(
-                        1 for f in os.listdir(full_path)
-                        if os.path.isfile(os.path.join(full_path, f))
-                    )
+
+                if book_path in db_paths_exact:
+                    continue  # exact match — all good
+
+                file_count = sum(
+                    1 for f in os.listdir(full_path)
+                    if os.path.isfile(os.path.join(full_path, f))
+                )
+
+                if book_path.lower() in db_paths_lower:
+                    # Same path, different casing — this is NOT an orphan.
+                    # It's a directory whose casing on disk doesn't match the DB.
+                    # fix_book_paths should handle this. Never delete these.
+                    case_mismatches.append({
+                        "disk_path": book_path,
+                        "full_path": full_path,
+                        "file_count": file_count,
+                    })
+                else:
+                    # Truly not in DB — real orphan
                     orphans.append({
                         "path": book_path,
                         "full_path": full_path,
                         "file_count": file_count,
                     })
                     if len(orphans) >= limit:
-                        return {"source": "filesystem_scan", "orphans": orphans}
+                        break
+            if len(orphans) >= limit:
+                break
     except PermissionError as e:
         return {"source": "filesystem_scan", "error": f"Permission denied: {e}"}
 
-    return {"source": "filesystem_scan", "orphans": orphans, "count": len(orphans)}
+    result = {
+        "source": "filesystem_scan",
+        "orphans": orphans,
+        "orphan_count": len(orphans),
+        "case_mismatches": case_mismatches,
+        "case_mismatch_count": len(case_mismatches),
+    }
+    if case_mismatches:
+        result["case_mismatch_warning"] = (
+            f"{len(case_mismatches)} director(ies) have wrong casing on disk vs DB. "
+            "These are NOT orphans — run fix_book_paths to rename them. "
+            "NEVER delete directories listed under case_mismatches."
+        )
+    return result
 
 
 def find_ghost_books(
@@ -588,14 +619,35 @@ def verify_file_integrity(
         """)
 
     missing = []
+    case_mismatches = []
+
     for r in rows:
         filename = f"{r['file_name']}.{r['format'].lower()}"
-        filepath = os.path.join(
-            library_path,
-            r["path"].replace("/", os.sep),
-            filename,
-        )
-        if not os.path.exists(filepath):
+        expected_dir = os.path.join(library_path, r["path"].replace("/", os.sep))
+        filepath = os.path.join(expected_dir, filename)
+
+        if os.path.exists(filepath):
+            # File accessible — but on Windows NTFS this can be a false positive
+            # if the directory casing on disk differs from the DB path.
+            # Verify by checking the ACTUAL directory name via os.listdir.
+            parent = os.path.dirname(expected_dir)
+            dir_name = os.path.basename(expected_dir)
+            if os.path.isdir(parent):
+                actual_names = os.listdir(parent)
+                if dir_name not in actual_names:
+                    # Accessible via case-insensitive lookup but casing differs
+                    actual = next(
+                        (n for n in actual_names if n.lower() == dir_name.lower()),
+                        None,
+                    )
+                    case_mismatches.append({
+                        "id": r["id"],
+                        "title": r["title"],
+                        "db_path": r["path"],
+                        "actual_dir_name": actual,
+                        "filename": filename,
+                    })
+        else:
             missing.append({
                 "id": r["id"],
                 "title": r["title"],
@@ -604,14 +656,28 @@ def verify_file_integrity(
             })
 
     total_checked = len(rows)
-    return {
-        "ok": len(missing) == 0,
+    ok = len(missing) == 0 and len(case_mismatches) == 0
+    result = {
+        "ok": ok,
         "missing_count": len(missing),
+        "case_mismatch_count": len(case_mismatches),
         "total_checked": total_checked,
         "missing": missing,
         "message": (
-            f"All {total_checked} format files present on disk."
-            if not missing
-            else f"{len(missing)} file(s) missing out of {total_checked} checked."
+            f"All {total_checked} format files present on disk with correct casing."
+            if ok
+            else (
+                f"{len(missing)} file(s) missing; "
+                f"{len(case_mismatches)} file(s) accessible but with wrong directory casing on disk "
+                f"(run fix_book_paths to fix). "
+                f"Total checked: {total_checked}."
+            )
         ),
     }
+    if case_mismatches:
+        result["case_mismatches"] = case_mismatches[:50]
+        result["case_mismatch_warning"] = (
+            "Directories with wrong casing are accessible on Windows but will cause "
+            "data loss if treated as orphans. Run fix_book_paths to rename them on disk."
+        )
+    return result
