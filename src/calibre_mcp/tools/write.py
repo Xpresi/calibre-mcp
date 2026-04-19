@@ -285,13 +285,17 @@ def _remove_books_sqlite(backend, books: list[dict]) -> list[dict]:
             })
 
         conn.execute("COMMIT")
-
-        # Clean up orphaned entities (authors/series/tags/publishers with no books)
-        orphan_result = _cleanup_orphans(conn)
-
     except Exception as exc:
         conn.execute("ROLLBACK")
+        conn.close()
         raise exc
+
+    # Books are committed; orphan cleanup is best-effort and reports its own status.
+    try:
+        orphan_result = _cleanup_orphans(conn)
+    except Exception as exc:
+        logger.exception("orphan cleanup failed after successful book removal")
+        orphan_result = {"status": "error", "error": str(exc), "cleaned": {}, "total": 0}
     finally:
         conn.close()
 
@@ -315,15 +319,10 @@ def _cleanup_orphans(conn: "sqlite3.Connection") -> dict:
 
     cleaned: dict[str, int] = {}
     for table, link_col, link_table in TABLES:
-        count = conn.execute(
-            f"SELECT COUNT(*) FROM {table} "
-            f"WHERE id NOT IN (SELECT {link_col} FROM {link_table})"
-        ).fetchone()[0]
-        if count:
-            conn.execute(
-                f"DELETE FROM {table} WHERE id NOT IN (SELECT {link_col} FROM {link_table})"
-            )
-        cleaned[table] = count
+        cursor = conn.execute(
+            f"DELETE FROM {table} WHERE id NOT IN (SELECT {link_col} FROM {link_table})"
+        )
+        cleaned[table] = cursor.rowcount if cursor.rowcount >= 0 else 0
 
     conn.commit()
     return {

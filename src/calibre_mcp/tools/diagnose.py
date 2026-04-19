@@ -632,21 +632,26 @@ def verify_file_integrity(
             # Verify by checking the ACTUAL directory name via os.listdir.
             parent = os.path.dirname(expected_dir)
             dir_name = os.path.basename(expected_dir)
+            actual_names: list[str] | None = None
             if os.path.isdir(parent):
-                actual_names = os.listdir(parent)
-                if dir_name not in actual_names:
-                    # Accessible via case-insensitive lookup but casing differs
-                    actual = next(
-                        (n for n in actual_names if n.lower() == dir_name.lower()),
-                        None,
-                    )
-                    case_mismatches.append({
-                        "id": r["id"],
-                        "title": r["title"],
-                        "db_path": r["path"],
-                        "actual_dir_name": actual,
-                        "filename": filename,
-                    })
+                try:
+                    actual_names = os.listdir(parent)
+                except (PermissionError, OSError):
+                    # Can't enumerate — skip case-mismatch check, trust os.path.exists
+                    actual_names = None
+            if actual_names is not None and dir_name not in actual_names:
+                # Accessible via case-insensitive lookup but casing differs
+                actual = next(
+                    (n for n in actual_names if n.lower() == dir_name.lower()),
+                    None,
+                )
+                case_mismatches.append({
+                    "id": r["id"],
+                    "title": r["title"],
+                    "db_path": r["path"],
+                    "actual_dir_name": actual,
+                    "filename": filename,
+                })
         else:
             missing.append({
                 "id": r["id"],

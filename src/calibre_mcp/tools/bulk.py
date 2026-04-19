@@ -171,7 +171,19 @@ def fix_book_paths(
                             )
                         except Exception as e:
                             if tmp_dir.exists():
-                                os.rename(str(tmp_dir), str(parent / actual_name))
+                                try:
+                                    os.rename(str(tmp_dir), str(parent / actual_name))
+                                except Exception as recovery_exc:
+                                    logger.error(
+                                        f"Recovery rename failed for {tmp_dir}: {recovery_exc}. "
+                                        f"Residual _casefix_ directory left on disk."
+                                    )
+                                    errors.append({
+                                        "id": fix["id"],
+                                        "error": f"Case rename failed and recovery failed: {e}; {recovery_exc}",
+                                        "residual_dir": str(tmp_dir),
+                                    })
+                                    continue
                             errors.append({"id": fix["id"], "error": f"Case rename failed: {e}"})
                             continue
                     # Regardless of whether filesystem rename was needed, update DB path
@@ -225,7 +237,15 @@ def fix_book_paths(
             conn.execute("ROLLBACK")
         except Exception:
             pass
-        return {"status": "error", "message": str(exc)}
+        # Prior incremental COMMITs are preserved — report partial progress.
+        return {
+            "status": "partial_error",
+            "message": str(exc),
+            "applied": len(applied),
+            "errors": len(errors),
+            "details": applied,
+            "error_details": errors,
+        }
     finally:
         conn.close()
 
