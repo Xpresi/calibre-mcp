@@ -86,31 +86,51 @@ def fix_book_paths(
         if current_path == expected_path:
             # DB path matches expected — but the disk directory might have wrong
             # casing (e.g. ALL-CAPS from a previous normalize_uppercase that only
-            # updated the DB). Check the actual directory name on disk.
+            # updated the DB). Check BOTH levels:
+            #   1. Author directory (library_root/AUTHOR_DIR) — most common mismatch
+            #   2. Book directory within author dir (AUTHOR_DIR/BOOK_DIR)
             disk_dir = library_path / expected_path.replace("/", os.sep)
-            parent = disk_dir.parent
-            if parent.exists():
-                try:
-                    parent_key = str(parent)
-                    if parent_key not in _listdir_cache:
-                        _listdir_cache[parent_key] = os.listdir(parent_key)
-                    actual = next(
-                        (n for n in _listdir_cache[parent_key]
+            author_disk = disk_dir.parent   # library_root / author_dir
+            library_root = str(library_path)
+
+            case_mismatch = False
+            try:
+                # Level 1: check author directory casing in library root
+                if library_root not in _listdir_cache:
+                    _listdir_cache[library_root] = os.listdir(library_root)
+                actual_author = next(
+                    (n for n in _listdir_cache[library_root]
+                     if n.lower() == author_disk.name.lower()),
+                    None,
+                )
+                if actual_author and actual_author != author_disk.name:
+                    case_mismatch = True
+
+                # Level 2: check book directory casing within author dir (if author ok)
+                if not case_mismatch and author_disk.exists():
+                    author_key = str(author_disk)
+                    if author_key not in _listdir_cache:
+                        _listdir_cache[author_key] = os.listdir(author_key)
+                    actual_book = next(
+                        (n for n in _listdir_cache[author_key]
                          if n.lower() == disk_dir.name.lower()),
                         None,
                     )
-                    if actual and actual != disk_dir.name:
-                        # Same path in DB but disk has wrong casing → needs rename
-                        fixes.append({
-                            "id":           book["id"],
-                            "title":        book["title"],
-                            "author":       book["author_name"],
-                            "current_path": current_path,
-                            "expected_path": expected_path,
-                            "_case_fix":    True,
-                        })
-                except (PermissionError, OSError):
-                    pass
+                    if actual_book and actual_book != disk_dir.name:
+                        case_mismatch = True
+
+            except (PermissionError, OSError):
+                pass
+
+            if case_mismatch:
+                fixes.append({
+                    "id":           book["id"],
+                    "title":        book["title"],
+                    "author":       book["author_name"],
+                    "current_path": current_path,
+                    "expected_path": expected_path,
+                    "_case_fix":    True,
+                })
             continue
 
         fixes.append({
