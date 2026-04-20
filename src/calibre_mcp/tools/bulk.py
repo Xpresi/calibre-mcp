@@ -72,6 +72,8 @@ def fix_book_paths(
         """)
 
     fixes = []
+    _listdir_cache: dict[str, list[str]] = {}  # cache os.listdir per parent dir
+
     for book in books:
         if not book["author_name"]:
             continue
@@ -85,12 +87,15 @@ def fix_book_paths(
             # DB path matches expected — but the disk directory might have wrong
             # casing (e.g. ALL-CAPS from a previous normalize_uppercase that only
             # updated the DB). Check the actual directory name on disk.
-            if not dry_run:
-                disk_dir = library_path / expected_path.replace("/", os.sep)
-                parent = disk_dir.parent
-                if parent.exists():
+            disk_dir = library_path / expected_path.replace("/", os.sep)
+            parent = disk_dir.parent
+            if parent.exists():
+                try:
+                    parent_key = str(parent)
+                    if parent_key not in _listdir_cache:
+                        _listdir_cache[parent_key] = os.listdir(parent_key)
                     actual = next(
-                        (n for n in os.listdir(str(parent))
+                        (n for n in _listdir_cache[parent_key]
                          if n.lower() == disk_dir.name.lower()),
                         None,
                     )
@@ -104,9 +109,10 @@ def fix_book_paths(
                             "expected_path": expected_path,
                             "_case_fix":    True,
                         })
+                except (PermissionError, OSError):
+                    pass
             continue
 
-        # In dry_run skip filesystem checks (avoids thousands of disk I/Os on big libraries)
         fixes.append({
             "id":           book["id"],
             "title":        book["title"],
