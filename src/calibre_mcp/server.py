@@ -2,6 +2,8 @@
 
 import json
 import logging
+import subprocess
+from datetime import datetime, timezone
 from typing import Any
 
 from mcp.server import Server
@@ -11,6 +13,26 @@ from mcp.types import Tool, TextContent
 from .backend import CalibreBackend, CalibreError
 from .config import Config
 from .tools import query, diagnose, write, bulk, report
+
+
+# ── Server identity (captured at import time = process start) ──────────
+
+def _get_git_commit() -> str:
+    """Return the short git commit hash of the running code, or 'unknown'."""
+    try:
+        import os
+        repo_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+        result = subprocess.run(
+            ["git", "rev-parse", "--short", "HEAD"],
+            capture_output=True, text=True, cwd=repo_dir, timeout=3,
+        )
+        return result.stdout.strip() if result.returncode == 0 else "unknown"
+    except Exception:
+        return "unknown"
+
+
+_SERVER_START_TIME = datetime.now(timezone.utc).isoformat()
+_SERVER_GIT_COMMIT = _get_git_commit()
 
 
 # ── Schema helpers ─────────────────────────────────────────────────────
@@ -118,6 +140,17 @@ def _error_response(msg: str) -> list[TextContent]:
 # ── Tool definitions ───────────────────────────────────────────────────
 
 TOOLS = [
+    # ── Server info ────────────────────────────────────────────────────
+    Tool(
+        name="get_server_info",
+        description=(
+            "Return the git commit hash and start time of the RUNNING server process. "
+            "Call this after committing MCP code changes to verify the server has been "
+            "restarted and is running the new code. If git_commit differs from the latest "
+            "commit, the server must be restarted before testing the changes."
+        ),
+        inputSchema={"type": "object", "properties": {}, "required": []},
+    ),
     # ── Stats ──────────────────────────────────────────────────────────
     Tool(
         name="library_stats",
@@ -673,6 +706,17 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
     arguments = _coerce(name, arguments)
     try:
         match name:
+            # Server info
+            case "get_server_info":
+                return _json_response({
+                    "git_commit": _SERVER_GIT_COMMIT,
+                    "started_at": _SERVER_START_TIME,
+                    "note": (
+                        "If git_commit does not match the latest commit in the repo, "
+                        "restart the MCP server before testing code changes."
+                    ),
+                })
+
             # Stats
             case "library_stats":
                 return _json_response(backend.get_library_stats())
