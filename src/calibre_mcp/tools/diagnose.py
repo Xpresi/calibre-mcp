@@ -487,26 +487,31 @@ def find_orphan_files(
 def find_ghost_books(
     backend,
     use_calibredb: bool = False,
-    limit: int = 100,
+    limit: int = 0,
     offset: int = 0,
 ) -> dict[str, Any]:
     """
     Find books in the DB whose directory or format files don't exist on disk.
+
+    By default (limit=0) scans ALL books in the library — this is the only
+    mode that gives a trustworthy result. Partial scans return
+    scan_status="INCOMPLETE" and must NOT be interpreted as "no ghosts found".
 
     Checks both:
     - Missing directory (book_dir does not exist)
     - Missing format files (directory exists but one or more .epub/.fb2/etc. files are gone)
 
     Two modes:
-    - use_calibredb=False (default): manual filesystem check — pageable,
-      never times out, returns structured data.
+    - use_calibredb=False (default): manual filesystem check — full scan by
+      default, paginatable via limit/offset when limit>0.
     - use_calibredb=True: runs 'calibredb check_library' (may time out on
       large libraries).
 
     Args:
         use_calibredb: Use calibredb check_library instead of manual scan.
-        limit:  Max books to check per call (for pagination).
-        offset: Skip this many books before checking (for pagination).
+        limit:  Max books to check (0 = all books, recommended). Use >0 only
+                for pagination. WARNING: partial scans report scan_status=INCOMPLETE.
+        offset: Skip this many books before checking (pagination only).
     """
     if use_calibredb:
         try:
@@ -519,20 +524,32 @@ def find_ghost_books(
         except Exception:
             pass  # Fall through to manual
 
-    # Manual check with pagination
+    # Manual check — full scan by default (limit=0), pageable when limit>0
     library_path = backend.config.library_path
 
     total_books = backend.query_db_scalar("SELECT COUNT(*) FROM books") or 0
 
-    rows = backend.query_db("""
-        SELECT b.id, b.title, b.author_sort, b.path,
-               GROUP_CONCAT(d.format || ':' || d.name, '|') as formats
-        FROM books b
-        LEFT JOIN data d ON d.book = b.id
-        GROUP BY b.id
-        ORDER BY b.id
-        LIMIT ? OFFSET ?
-    """, (limit, offset))
+    # Build query: full scan or paginated
+    full_scan = (limit == 0)
+    if full_scan:
+        rows = backend.query_db("""
+            SELECT b.id, b.title, b.author_sort, b.path,
+                   GROUP_CONCAT(d.format || ':' || d.name, '|') as formats
+            FROM books b
+            LEFT JOIN data d ON d.book = b.id
+            GROUP BY b.id
+            ORDER BY b.id
+        """)
+    else:
+        rows = backend.query_db("""
+            SELECT b.id, b.title, b.author_sort, b.path,
+                   GROUP_CONCAT(d.format || ':' || d.name, '|') as formats
+            FROM books b
+            LEFT JOIN data d ON d.book = b.id
+            GROUP BY b.id
+            ORDER BY b.id
+            LIMIT ? OFFSET ?
+        """, (limit, offset))
 
     ghosts = []
     for r in rows:
@@ -566,16 +583,32 @@ def find_ghost_books(
                     "missing_files": missing_files,
                 })
 
-    return {
+    checked = len(rows)
+    is_partial = not full_scan and (offset + checked) < total_books
+    scan_status = "INCOMPLETE" if is_partial else "COMPLETE"
+
+    result = {
         "source": "filesystem_check",
+        "scan_status": scan_status,
         "ghosts": ghosts,
         "count": len(ghosts),
-        "checked": len(rows),
-        "offset": offset,
+        "checked": checked,
         "total_books": total_books,
-        "has_more": (offset + len(rows)) < total_books,
-        "next_offset": offset + len(rows) if (offset + len(rows)) < total_books else None,
     }
+
+    if is_partial:
+        result["WARNING"] = (
+            f"INCOMPLETE SCAN: only {checked} of {total_books} books checked "
+            f"(offset={offset}, limit={limit}). "
+            "This result CANNOT be interpreted as 'no ghosts found'. "
+            "Call with limit=0 for a full reliable scan."
+        )
+        result["has_more"] = True
+        result["next_offset"] = offset + checked
+    else:
+        result["has_more"] = False
+
+    return result
 
 
 def verify_file_integrity(

@@ -324,15 +324,16 @@ TOOLS = [
         description=(
             "Find books in DB whose directory or format files don't exist on disk. "
             "Checks both missing directories AND missing format files within existing directories. "
-            "Default mode does a pageable manual filesystem check (never times out). "
+            "Default (limit=0) scans ALL books — only this mode gives a trustworthy result. "
+            "Partial scans (limit>0) return scan_status=INCOMPLETE and MUST NOT be interpreted as 'no ghosts found'. "
             "Set use_calibredb=true to use calibredb check_library instead (may time out on large libraries)."
         ),
         inputSchema={
             "type": "object",
             "properties": {
                 "use_calibredb": {"type": "boolean", "default": False, "description": "Use calibredb check_library instead of manual scan"},
-                "limit":  {"type": "integer", "default": 100, "description": "Books to check per call"},
-                "offset": {"type": "integer", "default": 0,   "description": "Skip this many books (for pagination)"},
+                "limit":  {"type": "integer", "default": 0, "description": "Books to check (0=ALL, recommended). Use >0 only for pagination. Partial scans are INCOMPLETE."},
+                "offset": {"type": "integer", "default": 0, "description": "Skip this many books (pagination only, use with limit>0)"},
             },
         },
     ),

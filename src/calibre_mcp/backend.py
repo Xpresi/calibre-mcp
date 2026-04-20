@@ -251,11 +251,17 @@ class CalibreBackend:
         """)
         stats["top_languages"] = {r["lang_code"]: r["cnt"] for r in languages}
 
-        # Books without any format file
-        stats["books_without_files"] = self.query_db_scalar("""
+        # Books with no format records in the DB (SQL-only — does NOT verify files exist on disk).
+        # A book can show 0 here and still be a ghost (file deleted but data row intact).
+        # Use find_ghost_books() for a real filesystem check.
+        stats["books_without_data_records"] = self.query_db_scalar("""
             SELECT COUNT(*) FROM books b
             WHERE NOT EXISTS (SELECT 1 FROM data d WHERE d.book = b.id)
         """) or 0
+        stats["_warning_books_without_data_records"] = (
+            "SQL-only check. Does NOT verify files exist on disk. "
+            "Run find_ghost_books() for a real filesystem check."
+        )
 
         # Books without cover
         stats["books_without_cover"] = self.query_db_scalar("""
