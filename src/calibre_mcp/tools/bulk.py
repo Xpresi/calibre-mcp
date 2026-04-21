@@ -212,6 +212,39 @@ def fix_book_paths(
                                     continue
                             errors.append({"id": fix["id"], "error": f"Case rename failed: {e}"})
                             continue
+
+                    # Level 1: also fix author-directory casing if needed.
+                    # The book-level rename above only fixes the subdirectory; the
+                    # author directory (e.g. "ABAD, SEBASTIAN") may still have wrong
+                    # casing on disk even after the book dir is correct.
+                    expected_author_dir = expected_full.parent
+                    if expected_author_dir != library_path:
+                        actual_author_name = next(
+                            (n for n in os.listdir(str(library_path))
+                             if n.lower() == expected_author_dir.name.lower()),
+                            None,
+                        )
+                        if actual_author_name and actual_author_name != expected_author_dir.name:
+                            tmp_author = library_path / f"_casefix_{uuid.uuid4().hex}"
+                            try:
+                                os.rename(str(library_path / actual_author_name), str(tmp_author))
+                                os.rename(str(tmp_author), str(expected_author_dir))
+                                logger.info(
+                                    f"Case-fixed author dir: {actual_author_name!r}"
+                                    f" → {expected_author_dir.name!r}"
+                                )
+                            except Exception as e:
+                                if tmp_author.exists():
+                                    try:
+                                        os.rename(str(tmp_author),
+                                                  str(library_path / actual_author_name))
+                                    except Exception:
+                                        pass
+                                logger.warning(
+                                    f"Failed to case-fix author dir"
+                                    f" {actual_author_name!r}: {e}"
+                                )
+
                     # Regardless of whether filesystem rename was needed, update DB path
                 else:
                     if current_full.exists():
