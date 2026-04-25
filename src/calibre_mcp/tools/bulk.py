@@ -937,6 +937,9 @@ def cleanup_orphan_links(
         ("books_tags_link", "book"),
         ("books_publishers_link", "book"),
         ("books_languages_link", "book"),
+        ("books_ratings_link", "book"),
+        ("books_pages_link", "book"),    # Count Pages plugin — has real FK constraint
+        ("books_plugin_data", "book"),   # Plugin metadata
         ("data", "book"),
         ("comments", "book"),
         ("identifiers", "book"),

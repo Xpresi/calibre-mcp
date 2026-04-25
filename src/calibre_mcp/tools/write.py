@@ -266,6 +266,8 @@ def _remove_books_sqlite(backend, books: list[dict]) -> list[dict]:
                 "identifiers",
                 "comments",
                 "data",
+                "books_pages_link",    # Count Pages plugin — has real FK constraint
+                "books_plugin_data",   # Plugin metadata (stores arbitrary plugin state per book)
             ):
                 conn.execute(f"DELETE FROM {table} WHERE book=?", (book_id,))
 
