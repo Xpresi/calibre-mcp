@@ -406,14 +406,35 @@ TOOLS = [
     ),
     Tool(
         name="set_book_metadata",
-        description="Set metadata fields on a book. Supported fields: title, authors, series, series_index, tags, publisher, pubdate, comments, languages, identifiers. Dry-run by default.",
+        description=(
+            "Set metadata fields on a book. Supported fields: title, authors, series, "
+            "series_index, tags, publisher, pubdate, comments, languages, identifiers. "
+            "For 'authors': accepts a single string (one author) or a list of strings "
+            "(multiple authors). All other fields are strings. Dry-run by default."
+        ),
         inputSchema={
             "type": "object",
             "properties": {
                 "book_id": {"type": "integer", "description": "Book ID to modify"},
                 "fields": {
                     "type": "object",
-                    "description": "Dict of field_name: new_value",
+                    "description": (
+                        "Dict of field_name: new_value. "
+                        "'authors' accepts a string or list of strings; "
+                        "all other fields are strings."
+                    ),
+                    "properties": {
+                        "authors": {
+                            "oneOf": [
+                                {"type": "string"},
+                                {"type": "array", "items": {"type": "string"}},
+                            ],
+                            "description": (
+                                "Author name(s) in 'Lastname, Firstname' format. "
+                                "String for a single author; list for multiple authors."
+                            ),
+                        },
+                    },
                     "additionalProperties": {"type": "string"},
                 },
                 "dry_run": {"type": "boolean", "default": True},

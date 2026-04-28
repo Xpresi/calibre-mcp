@@ -44,38 +44,54 @@ def _set_metadata_sqlite(backend, book_id: int, fields: dict) -> dict:
             changed.append(f"title → {title}")
 
         if "authors" in fields:
-            author_val = fields["authors"]  # expected: "Lastname, Firstname"
+            author_val = fields["authors"]
 
-            # Find existing author by sort key or exact name
-            row = conn.execute(
-                "SELECT id, name, sort FROM authors "
-                "WHERE sort=? OR name=? LIMIT 1",
-                (author_val, author_val),
-            ).fetchone()
-
-            if row:
-                author_id, author_name, author_sort = row
+            # Accept both a single string and a list of strings
+            if isinstance(author_val, str):
+                author_names = [author_val]
             else:
-                # Create new author entry
-                conn.execute(
-                    "INSERT INTO authors(name, sort, link) VALUES(?,?,'')",
-                    (author_val, author_val),
-                )
-                author_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
-                author_name, author_sort = author_val, author_val
+                author_names = [str(a) for a in author_val]
 
-            # Re-link book → author
+            author_ids: list[int] = []
+            author_sort_keys: list[str] = []
+
+            for aname in author_names:
+                # Find existing author by sort key or exact name
+                row = conn.execute(
+                    "SELECT id, name, sort FROM authors "
+                    "WHERE sort=? OR name=? LIMIT 1",
+                    (aname, aname),
+                ).fetchone()
+
+                if row:
+                    aid, aname_canon, asort = row
+                else:
+                    # Create new author entry
+                    conn.execute(
+                        "INSERT INTO authors(name, sort, link) VALUES(?,?,'')",
+                        (aname, aname),
+                    )
+                    aid = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+                    aname_canon, asort = aname, aname
+
+                author_ids.append(aid)
+                author_sort_keys.append(asort)
+
+            # Re-link book → authors (replace all existing links)
             conn.execute("DELETE FROM books_authors_link WHERE book=?", (book_id,))
-            conn.execute(
-                "INSERT INTO books_authors_link(book, author) VALUES(?,?)",
-                (book_id, author_id),
-            )
-            # Update denormalized author_sort on books table
+            for aid in author_ids:
+                conn.execute(
+                    "INSERT INTO books_authors_link(book, author) VALUES(?,?)",
+                    (book_id, aid),
+                )
+
+            # Update denormalized author_sort: Calibre joins multiple with " & "
+            combined_sort = " & ".join(author_sort_keys)
             conn.execute(
                 "UPDATE books SET author_sort=? WHERE id=?",
-                (author_sort, book_id),
+                (combined_sort, book_id),
             )
-            changed.append(f"author → {author_name} (sort: {author_sort})")
+            changed.append(f"authors → {author_names} (sort: {combined_sort})")
 
         if "series" in fields:
             series_name = fields["series"]
