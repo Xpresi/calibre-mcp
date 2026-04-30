@@ -322,17 +322,19 @@ def _remove_books_sqlite(backend, books: list[dict]) -> list[dict]:
 
 def _cleanup_orphans(conn: "sqlite3.Connection") -> dict:
     """
-    Delete orphaned rows from series/authors/tags/publishers.
+    Delete orphaned rows from series/authors/tags/publishers/languages.
 
     An entity with no linked books is always safe to remove — if new books are
-    added later for that author/series, Calibre will recreate the record. No
-    safety guards: empty = delete.
+    added later for that author/series/language, Calibre will recreate the record.
+    Missing this step causes "Foreign key violation: language is still referenced"
+    in Calibre GUI when the GUI tries to clean up a language after deleting a book.
     """
     TABLES = [
         ("series",     "series",    "books_series_link"),
         ("authors",    "author",    "books_authors_link"),
         ("tags",       "tag",       "books_tags_link"),
         ("publishers", "publisher", "books_publishers_link"),
+        ("languages",  "lang_code", "books_languages_link"),
     ]
 
     cleaned: dict[str, int] = {}
