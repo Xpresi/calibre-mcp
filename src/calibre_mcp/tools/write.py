@@ -28,8 +28,8 @@ def _set_metadata_sqlite(backend, book_id: int, fields: dict) -> dict:
     Much faster than calibredb for large libraries (no library scan).
     Handles: title, authors, series, series_index, publisher.
     """
+    conn = None  # must be initialised before try so except/finally can reference it safely
     try:
-
         conn = backend.connect_write(timeout=15)
         conn.execute("BEGIN")
         changed = []
@@ -245,11 +245,16 @@ def _set_metadata_sqlite(backend, book_id: int, fields: dict) -> dict:
         conn.execute("COMMIT")
         logger.info(f"SQLite updated book {book_id}: {changed}")
         return {"status": "success", "changes": changed}
-    except Exception as exc:
-        conn.execute("ROLLBACK")
-        raise exc
+    except Exception:
+        if conn is not None:
+            try:
+                conn.execute("ROLLBACK")
+            except Exception:
+                pass  # ignore rollback errors — connection may already be broken
+        raise
     finally:
-        conn.close()
+        if conn is not None:
+            conn.close()
 
 
 def _remove_books_sqlite(backend, books: list[dict]) -> list[dict]:
