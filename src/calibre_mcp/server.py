@@ -12,7 +12,7 @@ from mcp.types import Tool, TextContent
 
 from .backend import CalibreBackend, CalibreError
 from .config import Config
-from .tools import query, diagnose, write, bulk, report
+from .tools import query, diagnose, write, bulk, report, epub
 
 
 # ── Server identity (captured at import time = process start) ──────────
@@ -368,6 +368,24 @@ TOOLS = [
                 "limit":  {"type": "integer", "default": 0, "description": "Books to check (0=ALL, recommended). Use >0 only for pagination. Partial scans are INCOMPLETE."},
                 "offset": {"type": "integer", "default": 0, "description": "Skip this many books (pagination only, use with limit>0)"},
             },
+        },
+    ),
+    Tool(
+        name="get_epub_toc",
+        description=(
+            "Extract the TOC (table of contents) from a book's EPUB and detect scan-EPUB signals. "
+            "Use before deleting individual works that may already be covered by a recopilatorio "
+            "(collection EPUB). Returns: title, size_mb, toc entries (max 500), toc_source "
+            "(ncx/nav/none), is_likely_scan flag, and scan_signals (size>50MB, toc_pattern:generic_X%, "
+            "title:scan_marker). A scan-EPUB is a PDF-derived image-based EPUB, usually inferior to "
+            "text EPUBs and worth deleting if a text alternative exists."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "book_id": {"type": "integer", "description": "Book ID to inspect."},
+            },
+            "required": ["book_id"],
         },
     ),
     Tool(
@@ -780,6 +798,8 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
                 return _json_response(diagnose.find_ghost_books(backend, **arguments))
             case "verify_file_integrity":
                 return _json_response(diagnose.verify_file_integrity(backend, **arguments))
+            case "get_epub_toc":
+                return _json_response(epub.get_epub_toc(backend, **arguments))
 
             # Write operations
             case "remove_books":
