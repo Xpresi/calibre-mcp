@@ -376,9 +376,17 @@ def find_orphan_links(backend) -> dict[str, int]:
         ("books_tags_link", "book"),
         ("books_publishers_link", "book"),
         ("books_languages_link", "book"),
+        ("books_ratings_link", "book"),
+        ("books_pages_link", "book"),
+        ("books_plugin_data", "book"),
         ("data", "book"),
         ("comments", "book"),
         ("identifiers", "book"),
+        ("last_read_positions", "book"),
+        ("annotations", "book"),
+        ("annotations_dirtied", "book"),
+        ("metadata_dirtied", "book"),
+        ("conversion_options", "book"),
     ]
 
     results = {}

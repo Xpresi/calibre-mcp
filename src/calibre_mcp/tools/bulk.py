@@ -938,11 +938,16 @@ def cleanup_orphan_links(
         ("books_publishers_link", "book"),
         ("books_languages_link", "book"),
         ("books_ratings_link", "book"),
-        ("books_pages_link", "book"),    # Count Pages plugin — has real FK constraint
-        ("books_plugin_data", "book"),   # Plugin metadata
+        ("books_pages_link", "book"),      # Count Pages plugin — has real FK constraint
+        ("books_plugin_data", "book"),     # Plugin metadata
         ("data", "book"),
         ("comments", "book"),
         ("identifiers", "book"),
+        ("last_read_positions", "book"),   # Reading positions (per book/format/user/device)
+        ("annotations", "book"),           # Highlights, notes, bookmarks
+        ("annotations_dirtied", "book"),   # Calibre dirty-tracking for annotations
+        ("metadata_dirtied", "book"),      # Calibre dirty-tracking for metadata
+        ("conversion_options", "book"),    # Per-book conversion settings
     ]
 
     # Count orphans

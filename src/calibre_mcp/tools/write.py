@@ -274,17 +274,17 @@ def _remove_books_sqlite(backend, books: list[dict]) -> list[dict]:
         logger.warning("send2trash not installed — deleted files will NOT go to Recycle Bin")
 
     library_path = Path(backend.config.library_path)
-    conn = backend.connect_write(timeout=15)
+    conn = None  # must be initialised before try so except/finally can reference it safely
     removed = []
 
     try:
-        conn.execute("PRAGMA journal_mode=WAL")
+        conn = backend.connect_write(timeout=15)
         conn.execute("BEGIN")
 
         for book in books:
             book_id = book["id"]
 
-            # Delete from all link/child tables
+            # Delete from all link/child tables (standard Calibre tables + plugin tables)
             for table in (
                 "books_authors_link",
                 "books_tags_link",
@@ -295,8 +295,13 @@ def _remove_books_sqlite(backend, books: list[dict]) -> list[dict]:
                 "identifiers",
                 "comments",
                 "data",
-                "books_pages_link",    # Count Pages plugin — has real FK constraint
-                "books_plugin_data",   # Plugin metadata (stores arbitrary plugin state per book)
+                "books_pages_link",      # Count Pages plugin — has real FK constraint
+                "books_plugin_data",     # Plugin metadata (arbitrary plugin state per book)
+                "last_read_positions",   # Reading positions (per book/format/user/device)
+                "annotations",           # Highlights, notes, bookmarks
+                "annotations_dirtied",   # Calibre dirty-tracking for annotations
+                "metadata_dirtied",      # Calibre dirty-tracking for metadata
+                "conversion_options",    # Per-book conversion settings
             ):
                 conn.execute(f"DELETE FROM {table} WHERE book=?", (book_id,))
 
@@ -321,8 +326,12 @@ def _remove_books_sqlite(backend, books: list[dict]) -> list[dict]:
 
         conn.execute("COMMIT")
     except Exception as exc:
-        conn.execute("ROLLBACK")
-        conn.close()
+        if conn is not None:
+            try:
+                conn.execute("ROLLBACK")
+            except Exception:
+                pass
+            conn.close()
         raise exc
 
     # Books are committed; orphan cleanup is best-effort and reports its own status.
