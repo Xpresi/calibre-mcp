@@ -261,9 +261,17 @@ def _remove_books_sqlite(backend, books: list[dict]) -> list[dict]:
     """
     Remove books directly via SQLite + filesystem.
     Faster than calibredb remove for large libraries.
-    Deletes all DB records and the book directory on disk.
+    Sends book directory to the OS Recycle Bin (send2trash); falls back to
+    permanent deletion only if send2trash is not installed.
     """
     import shutil
+
+    try:
+        from send2trash import send2trash as _send2trash
+        _use_trash = True
+    except ImportError:
+        _use_trash = False
+        logger.warning("send2trash not installed — deleted files will NOT go to Recycle Bin")
 
     library_path = Path(backend.config.library_path)
     conn = backend.connect_write(timeout=15)
@@ -295,11 +303,15 @@ def _remove_books_sqlite(backend, books: list[dict]) -> list[dict]:
             # Delete from books table
             conn.execute("DELETE FROM books WHERE id=?", (book_id,))
 
-            # Delete book directory from disk
+            # Delete book directory from disk (to Recycle Bin if send2trash available)
             book_dir = library_path / book["path"]
             if book_dir.exists():
-                shutil.rmtree(book_dir)
-                logger.info(f"Deleted directory: {book_dir}")
+                if _use_trash:
+                    _send2trash(str(book_dir))
+                    logger.info(f"Sent to Recycle Bin: {book_dir}")
+                else:
+                    shutil.rmtree(book_dir)
+                    logger.info(f"Deleted permanently: {book_dir}")
 
             removed.append({
                 "id": book_id,

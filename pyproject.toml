@@ -22,6 +22,7 @@ classifiers = [
 ]
 dependencies = [
     "mcp[cli]>=1.0.0",
+    "send2trash>=1.8.0",
 ]
 
 [project.urls]
