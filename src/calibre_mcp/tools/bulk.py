@@ -950,20 +950,24 @@ def cleanup_orphan_links(
         ("conversion_options", "book"),    # Per-book conversion settings
     ]
 
-    # Count orphans
+    # Count orphans and collect orphaned book IDs per table
     counts = {}
+    orphan_ids: dict[str, list[int]] = {}
     for table, col in link_tables:
-        count = backend.query_db_scalar(f"""
-            SELECT COUNT(*) FROM {table} t
+        rows = backend.query_db(f"""
+            SELECT DISTINCT t.{col} as book_id FROM {table} t
             WHERE NOT EXISTS (SELECT 1 FROM books b WHERE b.id = t.{col})
         """)
-        if count and count > 0:
-            counts[table] = count
+        if rows:
+            ids = [r["book_id"] for r in rows]
+            counts[table] = len(ids)
+            orphan_ids[table] = ids
 
     if dry_run:
         return {
             "status": "dry_run",
             "orphan_counts": counts,
+            "orphan_book_ids": orphan_ids,
             "total": sum(counts.values()),
             "message": f"Found {sum(counts.values())} orphan link(s). Set dry_run=false to clean.",
         }
