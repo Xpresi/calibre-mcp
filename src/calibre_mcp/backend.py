@@ -189,6 +189,7 @@ class CalibreBackend:
         self.require_calibre_closed()
         conn = sqlite3.connect(str(self.db_path), timeout=timeout)
         conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA foreign_keys = ON")
         return conn
 
     # ── Utility methods ────────────────────────────────────────────────
