@@ -2,10 +2,12 @@
 
 import json
 import logging
+import re
 import shutil
 import sqlite3
 import subprocess
 import sys
+import uuid
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -13,6 +15,33 @@ from typing import Any
 from .config import Config
 
 logger = logging.getLogger("calibre_mcp")
+
+
+# ── Calibre custom SQLite functions ───────────────────────────────────────────
+# Calibre registers these at runtime when its process opens the DB. Without
+# them, triggers on books/series (books_update_trg, series_update_trg, etc.)
+# fail with "no such function". We register Python equivalents so direct SQLite
+# writes work even when Calibre is closed.
+
+_ARTICLE_RE = re.compile(
+    r'^(el|la|los|las|un|una|the|a|an|das|die|der|le|les|une)\s+',
+    re.IGNORECASE,
+)
+
+
+def _calibre_title_sort(title: str) -> str:
+    """Move leading articles to the end: 'El capitán' → 'capitán, El'."""
+    if not title:
+        return title or ""
+    m = _ARTICLE_RE.match(title)
+    if m:
+        return title[m.end():].strip() + ", " + title[: m.end()].strip()
+    return title
+
+
+def _calibre_uuid4() -> str:
+    """Return a new UUID4 string (used by books_insert_trg)."""
+    return str(uuid.uuid4())
 
 
 class CalibreError(Exception):
@@ -185,11 +214,19 @@ class CalibreBackend:
 
         Verifies Calibre is closed first, then opens the connection in WAL mode.
         Use this instead of sqlite3.connect() for all direct write operations.
+
+        Registers Calibre's custom SQLite functions so DB triggers don't fail:
+          - title_sort(text) — used by books_update_trg / series_update_trg
+          - uuid4()          — used by books_insert_trg
+        These functions are normally registered by the Calibre process at runtime;
+        without them, any UPDATE on books.title raises "no such function: title_sort".
         """
         self.require_calibre_closed()
         conn = sqlite3.connect(str(self.db_path), timeout=timeout)
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA foreign_keys = ON")
+        conn.create_function("title_sort", 1, _calibre_title_sort)
+        conn.create_function("uuid4", 0, _calibre_uuid4)
         return conn
 
     # ── Utility methods ────────────────────────────────────────────────
