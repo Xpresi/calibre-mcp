@@ -469,6 +469,18 @@ def merge_authors(
     if multi_author_warning:
         result["warning"] = multi_author_warning
 
+    # The merged author's name (used as a directory) may differ from the variant
+    # names — directories on disk stay stale until fix_book_paths is run, and OPF
+    # files stay stale until embed_metadata is run. Surface this so the caller
+    # doesn't end up with DB ↔ disk ↔ OPF drift.
+    result["next_steps"] = [
+        "Run fix_book_paths(dry_run=true) to rename book directories on disk",
+        "Run verify_file_integrity to confirm files still resolve after the path update",
+        "Run embed_metadata on the affected book IDs so OPF files reflect the merge "
+        "(otherwise restore_database from OPFs will recreate the variant authors)",
+    ]
+    result["affected_book_ids"] = [b["book_id"] for b in affected_books]
+
     return result
 
 
@@ -653,6 +665,23 @@ def normalize_uppercase(
         if conflicts:
             result["merges"] = len(conflicts)
             result["merged"] = [{"old": ch["old"], "merged_into_id": ch["conflict_id"]} for ch in conflicts]
+
+    # Renaming titles changes the book directory name (Title (id)) on disk, and
+    # any of these renames also leaves OPF files stale. Surface that explicitly
+    # so the caller knows there's a follow-up step.
+    if item_type == "titles":
+        affected_book_ids = [ch["id"] for ch in changes]
+        result["next_steps"] = [
+            "Run fix_book_paths(dry_run=true) to rename book directories on disk",
+            "Run verify_file_integrity to confirm files still resolve after the path update",
+            "Run embed_metadata on the affected book IDs so OPF files reflect the new titles",
+        ]
+        result["affected_book_ids"] = affected_book_ids
+    elif item_type in ("tags", "publishers", "series"):
+        result["next_steps"] = [
+            f"Run embed_metadata on books that use the renamed {item_type} so OPF files "
+            "stay in sync (otherwise restore_database from OPFs will recreate the old names)",
+        ]
     return result
 
 
@@ -832,6 +861,15 @@ def rename_author(
             f"Run fix_author_sort to correct their author_sort field."
         )
         result["multi_author_book_ids"] = [b["id"] for b in multi_author_books]
+
+    # Renaming an author changes the directory name (Author/Title (id)) on disk
+    # and leaves OPF files stale. Surface the follow-up steps explicitly.
+    result["next_steps"] = [
+        "Run fix_book_paths(dry_run=true) to rename the author directory on disk",
+        "Run verify_file_integrity to confirm files still resolve after the path update",
+        "Run embed_metadata on the author's books so OPF files reflect the new name "
+        "(otherwise restore_database from OPFs will recreate the old name)",
+    ]
 
     return result
 

@@ -22,13 +22,23 @@ def _compute_title_sort(title: str) -> str:
     return title
 
 
-def _set_metadata_sqlite(backend, book_id: int, fields: dict) -> dict:
+_RELATIONAL_FIELDS = {"authors", "series", "publisher", "tags", "languages"}
+
+
+def _set_metadata_sqlite(backend, book_id: int, fields: dict, cleanup_orphans: bool = True) -> dict:
     """
     Apply metadata changes directly via SQLite.
     Much faster than calibredb for large libraries (no library scan).
     Handles: title, authors, series, series_index, publisher.
+
+    Args:
+        cleanup_orphans: If True (default), prune orphan rows from authors/series/
+            tags/publishers/languages after the write. Set to False when called in
+            a tight loop (bulk_set_metadata) and run a single global cleanup at the
+            end instead.
     """
     conn = None  # must be initialised before try so except/finally can reference it safely
+    touched_relational = bool(_RELATIONAL_FIELDS & fields.keys())
     try:
         conn = backend.connect_write(timeout=15)
         conn.execute("BEGIN")
@@ -244,6 +254,18 @@ def _set_metadata_sqlite(backend, book_id: int, fields: dict) -> dict:
 
         conn.execute("COMMIT")
         logger.info(f"SQLite updated book {book_id}: {changed}")
+
+        # Prune orphan rows that may have been left behind when relational
+        # fields (series/publisher/tags/languages/authors) were re-linked. Without
+        # this, swapping a book's only series leaves the old series row dangling
+        # in the `series` table, which then drifts forever (matches the
+        # "El Millonario del Mes" case found by the post-mortem DB diff).
+        if cleanup_orphans and touched_relational:
+            try:
+                _cleanup_orphans(conn)
+            except Exception:
+                logger.exception(f"orphan cleanup failed after set_metadata for book {book_id}")
+
         return {"status": "success", "changes": changed}
     except Exception:
         if conn is not None:
@@ -529,9 +551,15 @@ def bulk_set_metadata(
         }
 
     applied, errors = [], []
+    touched_relational_any = False
     for u in valid_updates:
         try:
-            result = _set_metadata_sqlite(backend, u["book_id"], u.get("fields", {}))
+            fields = u.get("fields", {})
+            if _RELATIONAL_FIELDS & fields.keys():
+                touched_relational_any = True
+            # Skip per-row cleanup; we run a single global cleanup at the end
+            # so the cost is paid once instead of N times.
+            result = _set_metadata_sqlite(backend, u["book_id"], fields, cleanup_orphans=False)
             applied.append({
                 "book_id": u["book_id"],
                 "title": existing_map[u["book_id"]],
@@ -540,13 +568,29 @@ def bulk_set_metadata(
         except Exception as exc:
             errors.append({"book_id": u["book_id"], "error": str(exc)})
 
-    return {
+    # Single post-bulk orphan sweep — see _set_metadata_sqlite for rationale.
+    orphans_cleaned = None
+    if touched_relational_any and applied:
+        try:
+            conn = backend.connect_write(timeout=15)
+            try:
+                orphans_cleaned = _cleanup_orphans(conn)
+            finally:
+                conn.close()
+        except Exception as exc:
+            logger.exception("orphan cleanup failed after bulk_set_metadata")
+            orphans_cleaned = {"status": "error", "error": str(exc)}
+
+    result = {
         "status": "completed",
         "applied": len(applied),
         "errors": len(errors),
         "missing_ids": missing,
         "error_details": errors,
     }
+    if orphans_cleaned is not None:
+        result["orphans_cleaned"] = orphans_cleaned
+    return result
 
 
 def backup_database(backend, suffix: str | None = None) -> dict[str, Any]:
