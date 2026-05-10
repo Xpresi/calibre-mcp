@@ -498,7 +498,13 @@ TOOLS = [
     ),
     Tool(
         name="backup_metadata_opf",
-        description="Export per-book metadata to OPF files in each book's directory (calibredb backup_metadata). Different from backup_database — this is per-book, useful against DB corruption.",
+        description=(
+            "Export per-book metadata to OPF files in each book's directory "
+            "(calibredb backup_metadata). Different from backup_database — this is "
+            "per-book, useful against DB corruption and to protect changes from "
+            "restore_database reverting them. Runs as a BACKGROUND process (returns "
+            "immediately with PID + log_file path). Allow 10-30 min for large libraries."
+        ),
         inputSchema={"type": "object", "properties": {}},
     ),
     Tool(
@@ -675,7 +681,9 @@ TOOLS = [
             "Rename book directories on disk to match current author/title in DB, "
             "and update books.path accordingly. Use after bulk metadata edits that "
             "bypassed calibredb (direct SQLite), which leaves directory names stale. "
-            "Can target specific book_ids or scan all books. Dry-run by default."
+            "Can target specific book_ids or scan all books. Dry-run by default. "
+            "For large libraries (>10k fixes), use batch_size=3000 to avoid timeouts: "
+            "call repeatedly incrementing offset until more_remaining=false."
         ),
         inputSchema={
             "type": "object",
@@ -683,6 +691,10 @@ TOOLS = [
                 "book_ids": {"type": "array", "items": {"type": "integer"},
                              "description": "Specific book IDs. If omitted, scans ALL books."},
                 "dry_run": {"type": "boolean", "default": True},
+                "batch_size": {"type": "integer", "default": 0,
+                               "description": "Max fixes per call (0=unlimited). Use 3000 for large libs."},
+                "offset": {"type": "integer", "default": 0,
+                           "description": "Skip first N fixes (for pagination with batch_size)."},
             },
         },
     ),

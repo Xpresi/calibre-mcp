@@ -3,6 +3,8 @@
 import logging
 import re
 import sqlite3
+import subprocess
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -734,13 +736,42 @@ def backup_metadata_opf(backend) -> dict[str, Any]:
     Creates/updates .opf files inside each book's directory.
     This is different from backup_database — it's per-book OPF, useful as
     a safety net against database corruption.
+
+    Runs as a detached background process to avoid MCP timeouts on large
+    libraries (can take 10-30 min for 70k books). Returns immediately with
+    the PID and log file path; check the log file to confirm completion.
     """
     try:
-        output = backend.run_calibredb("backup_metadata", timeout=600)
+        log_path = Path(backend.config.library_path) / "_backup_metadata.log"
+        cmd = [
+            backend.calibredb,
+            "backup_metadata",
+            "--with-library", backend.library,
+            "--all",
+        ]
+        log_file = open(log_path, "w", encoding="utf-8")
+        kwargs: dict = {
+            "stdout": log_file,
+            "stderr": subprocess.STDOUT,
+        }
+        if sys.platform == "win32":
+            kwargs["creationflags"] = (
+                subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
+            )
+        else:
+            kwargs["start_new_session"] = True
+
+        proc = subprocess.Popen(cmd, **kwargs)
         return {
-            "status": "success",
-            "calibredb_output": output.strip(),
-            "message": "Metadata backed up to OPF files in each book's directory.",
+            "status": "started",
+            "pid": proc.pid,
+            "log_file": str(log_path),
+            "message": (
+                f"calibredb backup_metadata running in background (PID {proc.pid}). "
+                f"Output is being written to: {log_path}. "
+                "Allow 10-30 min for large libraries. "
+                "Check the log file's last lines to confirm completion."
+            ),
         }
     except Exception as e:
         return {"status": "error", "message": str(e)}

@@ -31,6 +31,8 @@ def fix_book_paths(
     backend,
     book_ids: list[int] | None = None,
     dry_run: bool = True,
+    batch_size: int = 0,
+    offset: int = 0,
 ) -> dict[str, Any]:
     """
     Rename book directories on disk to match current author/title in DB,
@@ -39,9 +41,16 @@ def fix_book_paths(
     Use this after bulk metadata edits that bypassed calibredb (direct SQLite),
     which leaves directory names stale.
 
+    For large libraries (>10k fixes), use batch_size to avoid MCP timeouts:
+      fix_book_paths(dry_run=false, batch_size=3000, offset=0)   # first batch
+      fix_book_paths(dry_run=false, batch_size=3000, offset=3000) # second batch
+      ...repeat until more_remaining=false...
+
     Args:
         book_ids: Specific book IDs to check. If None, scans all books.
         dry_run: If True, only report what would change.
+        batch_size: Max fixes to apply per call (0 = unlimited). Use 3000 for large libs.
+        offset: Skip the first N fixes (for pagination). Ignored when dry_run=True.
     """
     library_path = Path(backend.config.library_path)
 
@@ -153,8 +162,15 @@ def fix_book_paths(
     if not fixes:
         return {"status": "no_action", "message": "All paths are already correct."}
 
-    # Apply fixes — use incremental commits (COMMIT_EVERY books) so that partial
-    # progress is preserved if the MCP call is cancelled (e.g. client-side timeout).
+    # Apply fixes — optionally in a batch window to avoid MCP timeouts on large libs.
+    total_fixes = len(fixes)
+    if batch_size > 0:
+        fixes = fixes[offset: offset + batch_size]
+    more_remaining = batch_size > 0 and (offset + batch_size) < total_fixes
+    next_offset    = offset + batch_size if more_remaining else None
+
+    # Use incremental commits (COMMIT_EVERY books) so that partial progress is
+    # preserved if the MCP call is cancelled (e.g. client-side timeout).
     COMMIT_EVERY = 1000
     conn = backend.connect_write(timeout=15)
     applied, errors = [], []
@@ -308,13 +324,24 @@ def fix_book_paths(
     finally:
         conn.close()
 
-    return {
+    result: dict[str, Any] = {
         "status":       "success",
         "applied":      len(applied),
         "errors":       len(errors),
         "details":      applied,
         "error_details": errors,
     }
+    if batch_size > 0:
+        result["more_remaining"] = more_remaining
+        result["total_fixes_found"] = total_fixes
+        if more_remaining:
+            result["next_offset"] = next_offset
+            result["message"] = (
+                f"Batch complete: applied {len(applied)}, "
+                f"{total_fixes - offset - len(applied) - len(errors)} more pending. "
+                f"Call again with offset={next_offset}."
+            )
+    return result
 
 
 def merge_authors(
