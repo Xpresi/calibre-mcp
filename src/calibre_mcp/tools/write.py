@@ -1,7 +1,6 @@
 """Write operations for the Calibre library via calibredb CLI (Hito 3)."""
 
 import logging
-import re
 import sqlite3
 import subprocess
 import sys
@@ -13,16 +12,11 @@ logger = logging.getLogger("calibre_mcp")
 
 # ── SQLite helpers for fast metadata writes ────────────────────────────────
 
-def _compute_title_sort(title: str) -> str:
-    """Remove leading articles so 'El capitán' sorts as 'capitán, El'."""
-    m = re.match(
-        r'^(el|la|los|las|un|una|the|a|an|das|die|der|le|les|une)\s+',
-        title, re.IGNORECASE,
-    )
-    if m:
-        return title[m.end():].strip() + ", " + title[:m.end()].strip()
-    return title
-
+from ..backend import (  # noqa: E402
+    BOOK_CHILD_TABLES,
+    METADATA_TABLES,
+    _calibre_title_sort as _compute_title_sort,
+)
 
 _RELATIONAL_FIELDS = {"authors", "series", "publisher", "tags", "languages"}
 
@@ -308,26 +302,9 @@ def _remove_books_sqlite(backend, books: list[dict]) -> list[dict]:
         for book in books:
             book_id = book["id"]
 
-            # Delete from all link/child tables (standard Calibre tables + plugin tables)
-            for table in (
-                "books_authors_link",
-                "books_tags_link",
-                "books_series_link",
-                "books_publishers_link",
-                "books_languages_link",
-                "books_ratings_link",
-                "identifiers",
-                "comments",
-                "data",
-                "books_pages_link",      # Count Pages plugin — has real FK constraint
-                "books_plugin_data",     # Plugin metadata (arbitrary plugin state per book)
-                "last_read_positions",   # Reading positions (per book/format/user/device)
-                "annotations",           # Highlights, notes, bookmarks
-                "annotations_dirtied",   # Calibre dirty-tracking for annotations
-                "metadata_dirtied",      # Calibre dirty-tracking for metadata
-                "conversion_options",    # Per-book conversion settings
-            ):
-                conn.execute(f"DELETE FROM {table} WHERE book=?", (book_id,))
+            # Delete from every per-book child table (see backend.BOOK_CHILD_TABLES).
+            for table, col in BOOK_CHILD_TABLES:
+                conn.execute(f"DELETE FROM {table} WHERE {col}=?", (book_id,))
 
             # Delete from books table
             conn.execute("DELETE FROM books WHERE id=?", (book_id,))
@@ -379,16 +356,8 @@ def _cleanup_orphans(conn: "sqlite3.Connection") -> dict:
     Missing this step causes "Foreign key violation: language is still referenced"
     in Calibre GUI when the GUI tries to clean up a language after deleting a book.
     """
-    TABLES = [
-        ("series",     "series",    "books_series_link"),
-        ("authors",    "author",    "books_authors_link"),
-        ("tags",       "tag",       "books_tags_link"),
-        ("publishers", "publisher", "books_publishers_link"),
-        ("languages",  "lang_code", "books_languages_link"),
-    ]
-
     cleaned: dict[str, int] = {}
-    for table, link_col, link_table in TABLES:
+    for table, link_col, link_table in METADATA_TABLES:
         cursor = conn.execute(
             f"DELETE FROM {table} WHERE id NOT IN (SELECT {link_col} FROM {link_table})"
         )

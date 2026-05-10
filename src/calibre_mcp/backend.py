@@ -8,6 +8,7 @@ import sqlite3
 import subprocess
 import sys
 import uuid
+from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -42,6 +43,57 @@ def _calibre_title_sort(title: str) -> str:
 def _calibre_uuid4() -> str:
     """Return a new UUID4 string (used by books_insert_trg)."""
     return str(uuid.uuid4())
+
+
+def calibre_sanitize(s: str) -> str:
+    """
+    Sanitize a string to a Calibre-compatible filesystem path component.
+    Calibre replaces backslash, forward slash, colon, asterisk, question mark,
+    double quote, angle brackets, pipe, AND periods with underscores on Windows.
+    """
+    s = re.sub(r'[\\/:*?"<>|.]', '_', s)
+    return s.strip()[:200]
+
+
+# ── Schema constants ────────────────────────────────────────────────────────
+# Single source of truth for the per-book child tables and metadata tables.
+# Used by remove_books, find/cleanup_orphan_links, and find_orphaned_metadata
+# to guarantee they all touch the same set of tables.
+
+# (table_name, book-id column) — every table that has a foreign key to books.id.
+# When a book is removed, every row referencing it in these tables must go.
+# When orphan links are detected, every entry whose book.id no longer exists
+# in `books` is an orphan.
+BOOK_CHILD_TABLES: list[tuple[str, str]] = [
+    ("books_authors_link",     "book"),
+    ("books_series_link",      "book"),
+    ("books_tags_link",        "book"),
+    ("books_publishers_link",  "book"),
+    ("books_languages_link",   "book"),
+    ("books_ratings_link",     "book"),
+    ("books_pages_link",       "book"),  # Count Pages plugin — has real FK constraint
+    ("books_plugin_data",      "book"),  # Plugin metadata
+    ("data",                   "book"),
+    ("comments",               "book"),
+    ("identifiers",            "book"),
+    ("last_read_positions",    "book"),  # Reading positions (per book/format/user/device)
+    ("annotations",            "book"),  # Highlights, notes, bookmarks
+    ("annotations_dirtied",    "book"),  # Calibre dirty-tracking for annotations
+    ("metadata_dirtied",       "book"),  # Calibre dirty-tracking for metadata
+    ("conversion_options",     "book"),  # Per-book conversion settings
+]
+
+# (entity_table, link_col_in_link_table, link_table) — the metadata entity
+# tables that can become orphan when no books reference them. languages MUST
+# be included: a stale 'eng' row triggers FK violations in the Calibre GUI
+# when it tries its own cleanup pass after a deletion.
+METADATA_TABLES: list[tuple[str, str, str]] = [
+    ("authors",    "author",    "books_authors_link"),
+    ("series",     "series",    "books_series_link"),
+    ("tags",       "tag",       "books_tags_link"),
+    ("publishers", "publisher", "books_publishers_link"),
+    ("languages",  "lang_code", "books_languages_link"),
+]
 
 
 class CalibreError(Exception):
@@ -228,6 +280,45 @@ class CalibreBackend:
         conn.create_function("title_sort", 1, _calibre_title_sort)
         conn.create_function("uuid4", 0, _calibre_uuid4)
         return conn
+
+    @contextmanager
+    def write_transaction(self, timeout: int = 30):
+        """
+        Context manager for a managed write transaction on metadata.db.
+
+        Wraps connect_write + explicit BEGIN. On normal exit: COMMIT and close.
+        On any exception: best-effort ROLLBACK (never raises from rollback) +
+        close, then re-raises the original exception.
+
+        Use this everywhere you'd otherwise hand-roll the
+            try: conn = backend.connect_write(); conn.execute("BEGIN")
+                ...
+                conn.execute("COMMIT")
+            except: conn.execute("ROLLBACK"); raise
+            finally: conn.close()
+        boilerplate. The hand-rolled versions had drifted: some forgot to
+        close on the rollback path, some swallowed the original exception
+        when rollback itself failed.
+        """
+        conn = self.connect_write(timeout=timeout)
+        conn.execute("BEGIN")
+        try:
+            yield conn
+            conn.execute("COMMIT")
+        except Exception:
+            try:
+                conn.execute("ROLLBACK")
+            except Exception:
+                logger.exception(
+                    "ROLLBACK failed (connection may already be broken); "
+                    "original error will still be raised"
+                )
+            raise
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
 
     # ── Utility methods ────────────────────────────────────────────────
 

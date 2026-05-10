@@ -2,29 +2,70 @@
 
 import logging
 import os
-import re
 import shutil
 import sqlite3
 import uuid
 from pathlib import Path
 from typing import Any
 
+from ..backend import (
+    BOOK_CHILD_TABLES,
+    METADATA_TABLES,
+    calibre_sanitize as _calibre_sanitize,
+)
 from ..utils.titlecase import smart_title_case, is_all_uppercase
 
 logger = logging.getLogger("calibre_mcp")
 
 
-# ── Path-fixing helpers ────────────────────────────────────────────────────
+def _case_only_rename(parent: Path, current_name: str, target_name: str) -> dict[str, Any]:
+    """
+    Two-step rename for case-only directory changes on Windows NTFS.
 
-def _calibre_sanitize(s: str) -> str:
+    A direct os.rename() to a path that differs only in case is a no-op on
+    NTFS. To force the casing to update on disk, rename to a temporary name
+    first, then to the target. Discovers the actual on-disk name (which may
+    differ in case from `current_name`) before renaming.
+
+    Returns one of:
+      {"status": "noop"}                  — disk name already matches target,
+                                            or no matching directory exists.
+      {"status": "renamed", "from": str}  — rename succeeded; "from" is the
+                                            previous on-disk name.
+      {"status": "error", "error": str,
+       "residual_dir": str | None}        — both rename attempts failed.
+                                            residual_dir is set only when the
+                                            tmp dir was created but recovery
+                                            failed (orphan left on disk).
     """
-    Sanitize a string to a Calibre-compatible filesystem path component.
-    Calibre replaces backslash, forward slash, colon, asterisk, question mark,
-    double quote, angle brackets, pipe, AND periods with underscores on Windows.
-    """
-    s = re.sub(r'[\\/:*?"<>|.]', '_', s)
-    s = s.strip()
-    return s[:200]
+    actual_name = next(
+        (n for n in os.listdir(str(parent)) if n.lower() == current_name.lower()),
+        None,
+    )
+    if not actual_name or actual_name == target_name:
+        return {"status": "noop"}
+
+    tmp_dir = parent / f"_casefix_{uuid.uuid4().hex}"
+    try:
+        os.rename(str(parent / actual_name), str(tmp_dir))
+        os.rename(str(tmp_dir), str(parent / target_name))
+        logger.info(f"Case-fixed dir: {actual_name!r} → {target_name!r}")
+        return {"status": "renamed", "from": actual_name}
+    except Exception as e:
+        if tmp_dir.exists():
+            try:
+                os.rename(str(tmp_dir), str(parent / actual_name))
+            except Exception as recovery_exc:
+                logger.error(
+                    f"Recovery rename failed for {tmp_dir}: {recovery_exc}. "
+                    f"Residual _casefix_ directory left on disk."
+                )
+                return {
+                    "status": "error",
+                    "error": f"Case rename failed and recovery failed: {e}; {recovery_exc}",
+                    "residual_dir": str(tmp_dir),
+                }
+        return {"status": "error", "error": f"Case rename failed: {e}"}
 
 
 def fix_book_paths(
@@ -190,76 +231,35 @@ def fix_book_paths(
 
                 if is_case_only:
                     # On Windows NTFS, source and destination are the same physical
-                    # directory when only casing differs. A direct rename() call would
-                    # be a no-op. Use a two-step rename via a temporary name so the
-                    # directory's actual casing on disk is updated.
-                    # Without this, find_orphan_files would later mistake the directory
-                    # for an orphan (case-sensitive mismatch) and could delete it.
-                    actual_dir = current_full
-                    # Find actual disk name (may differ in case from DB path)
-                    parent = actual_dir.parent
-                    actual_name = next(
-                        (n for n in os.listdir(str(parent))
-                         if n.lower() == actual_dir.name.lower()),
-                        None,
-                    )
-                    if actual_name and actual_name != expected_full.name:
-                        tmp_dir = parent / f"_casefix_{uuid.uuid4().hex}"
-                        try:
-                            os.rename(str(parent / actual_name), str(tmp_dir))
-                            os.rename(str(tmp_dir), str(expected_full))
-                            logger.info(
-                                f"Case-fixed dir: {actual_name!r} → {expected_full.name!r}"
-                            )
-                        except Exception as e:
-                            if tmp_dir.exists():
-                                try:
-                                    os.rename(str(tmp_dir), str(parent / actual_name))
-                                except Exception as recovery_exc:
-                                    logger.error(
-                                        f"Recovery rename failed for {tmp_dir}: {recovery_exc}. "
-                                        f"Residual _casefix_ directory left on disk."
-                                    )
-                                    errors.append({
-                                        "id": fix["id"],
-                                        "error": f"Case rename failed and recovery failed: {e}; {recovery_exc}",
-                                        "residual_dir": str(tmp_dir),
-                                    })
-                                    continue
-                            errors.append({"id": fix["id"], "error": f"Case rename failed: {e}"})
-                            continue
+                    # directory when only casing differs. A direct rename() is a no-op.
+                    # _case_only_rename does a two-step rename via a temp name so the
+                    # directory's casing on disk actually updates. Without this,
+                    # find_orphan_files later mistakes the dir for an orphan.
 
-                    # Level 1: also fix author-directory casing if needed.
-                    # The book-level rename above only fixes the subdirectory; the
-                    # author directory (e.g. "ABAD, SEBASTIAN") may still have wrong
-                    # casing on disk even after the book dir is correct.
+                    # Level 2: book directory casing
+                    book_result = _case_only_rename(
+                        current_full.parent, current_full.name, expected_full.name
+                    )
+                    if book_result["status"] == "error":
+                        err = {"id": fix["id"], "error": book_result["error"]}
+                        if "residual_dir" in book_result:
+                            err["residual_dir"] = book_result["residual_dir"]
+                        errors.append(err)
+                        continue
+
+                    # Level 1: author directory casing (book-level rename above only
+                    # fixes the subdir; author dir e.g. "ABAD, SEBASTIAN" may still
+                    # have wrong casing). Failure here is non-fatal — log + proceed.
                     expected_author_dir = expected_full.parent
                     if expected_author_dir != library_path:
-                        actual_author_name = next(
-                            (n for n in os.listdir(str(library_path))
-                             if n.lower() == expected_author_dir.name.lower()),
-                            None,
+                        author_result = _case_only_rename(
+                            library_path, expected_author_dir.name, expected_author_dir.name
                         )
-                        if actual_author_name and actual_author_name != expected_author_dir.name:
-                            tmp_author = library_path / f"_casefix_{uuid.uuid4().hex}"
-                            try:
-                                os.rename(str(library_path / actual_author_name), str(tmp_author))
-                                os.rename(str(tmp_author), str(expected_author_dir))
-                                logger.info(
-                                    f"Case-fixed author dir: {actual_author_name!r}"
-                                    f" → {expected_author_dir.name!r}"
-                                )
-                            except Exception as e:
-                                if tmp_author.exists():
-                                    try:
-                                        os.rename(str(tmp_author),
-                                                  str(library_path / actual_author_name))
-                                    except Exception:
-                                        pass
-                                logger.warning(
-                                    f"Failed to case-fix author dir"
-                                    f" {actual_author_name!r}: {e}"
-                                )
+                        if author_result["status"] == "error":
+                            logger.warning(
+                                f"Failed to case-fix author dir "
+                                f"{expected_author_dir.name!r}: {author_result['error']}"
+                            )
 
                     # Regardless of whether filesystem rename was needed, update DB path
                 else:
@@ -415,57 +415,46 @@ def merge_authors(
         return {"status": "no_action", "message": "No books to reroute."}
 
     # ── Apply via direct SQLite (calibredb times out on large libraries) ────
-    db_path = str(backend.db_path)
     errors = []
     try:
-        conn = backend.connect_write(timeout=30)
-        conn.execute("BEGIN")
+        with backend.write_transaction(timeout=30) as conn:
+            for book in affected_books:
+                try:
+                    # Check if the book already has canonical author linked
+                    already = conn.execute(
+                        "SELECT id FROM books_authors_link WHERE book=? AND author=?",
+                        (book["book_id"], canonical_id),
+                    ).fetchone()
 
-        for book in affected_books:
-            try:
-                # Check if the book already has canonical author linked
-                already = conn.execute(
-                    "SELECT id FROM books_authors_link WHERE book=? AND author=?",
-                    (book["book_id"], canonical_id),
-                ).fetchone()
+                    if already:
+                        # Just remove the variant link
+                        conn.execute(
+                            "DELETE FROM books_authors_link WHERE book=? AND author=?",
+                            (book["book_id"], book["old_author_id"]),
+                        )
+                    else:
+                        # Reroute: point existing link to canonical
+                        conn.execute(
+                            "UPDATE books_authors_link SET author=? WHERE book=? AND author=?",
+                            (canonical_id, book["book_id"], book["old_author_id"]),
+                        )
 
-                if already:
-                    # Just remove the variant link
+                    # Update denormalized author_sort on books table
                     conn.execute(
-                        "DELETE FROM books_authors_link WHERE book=? AND author=?",
-                        (book["book_id"], book["old_author_id"]),
+                        "UPDATE books SET author_sort=? WHERE id=?",
+                        (canonical["sort"], book["book_id"]),
                     )
-                else:
-                    # Reroute: point existing link to canonical
-                    conn.execute(
-                        "UPDATE books_authors_link SET author=? WHERE book=? AND author=?",
-                        (canonical_id, book["book_id"], book["old_author_id"]),
-                    )
+                except Exception as exc:
+                    errors.append({"book_id": book["book_id"], "error": str(exc)})
 
-                # Update denormalized author_sort on books table
-                conn.execute(
-                    "UPDATE books SET author_sort=? WHERE id=?",
-                    (canonical["sort"], book["book_id"]),
-                )
-            except Exception as exc:
-                errors.append({"book_id": book["book_id"], "error": str(exc)})
-
-        # Delete variant author records (only if they have no remaining links)
-        for v in variants:
-            remaining = conn.execute(
-                "SELECT COUNT(*) FROM books_authors_link WHERE author=?", (v["id"],)
-            ).fetchone()[0]
-            if remaining == 0:
-                conn.execute("DELETE FROM authors WHERE id=?", (v["id"],))
-
-        conn.execute("COMMIT")
-        conn.close()
+            # Delete variant author records (only if they have no remaining links)
+            for v in variants:
+                remaining = conn.execute(
+                    "SELECT COUNT(*) FROM books_authors_link WHERE author=?", (v["id"],)
+                ).fetchone()[0]
+                if remaining == 0:
+                    conn.execute("DELETE FROM authors WHERE id=?", (v["id"],))
     except Exception as exc:
-        try:
-            conn.execute("ROLLBACK")
-            conn.close()
-        except Exception:
-            pass
         return {"status": "error", "message": str(exc)}
 
     # Check if any affected books have multiple authors (co-author situation)
@@ -624,60 +613,47 @@ def normalize_uppercase(
         return {"status": "no_action", "message": "No uppercase items found."}
 
     # ── Apply via direct SQLite (calibredb times out on large libraries) ────
-    db_path = str(backend.db_path)
     try:
-        conn = backend.connect_write(timeout=30)
-        conn.execute("BEGIN")
-
-        if item_type == "titles":
-            for ch in changes:
-                new_sort = _compute_title_sort(ch["new"])
-                conn.execute(
-                    "UPDATE books SET title=?, sort=? WHERE id=?",
-                    (ch["new"], new_sort, ch["id"]),
-                )
-
-        elif item_type == "tags":
-            # Tags table has a unique constraint on name — rename directly
-            for ch in changes:
-                conn.execute(
-                    "UPDATE tags SET name=? WHERE id=?",
-                    (ch["new"], ch["id"]),
-                )
-
-        elif item_type == "publishers":
-            # Publishers table has a unique constraint on name — rename directly
-            for ch in changes:
-                conn.execute(
-                    "UPDATE publishers SET name=? WHERE id=?",
-                    (ch["new"], ch["id"]),
-                )
-
-        elif item_type == "series":
-            merges = 0
-            for ch in changes:
-                if ch["conflict_id"]:
-                    # Merge: move all books to existing series, delete old
+        with backend.write_transaction(timeout=30) as conn:
+            if item_type == "titles":
+                for ch in changes:
+                    new_sort = _compute_title_sort(ch["new"])
                     conn.execute(
-                        "UPDATE books_series_link SET series=? WHERE series=?",
-                        (ch["conflict_id"], ch["id"]),
-                    )
-                    conn.execute("DELETE FROM series WHERE id=?", (ch["id"],))
-                    merges += 1
-                else:
-                    conn.execute(
-                        "UPDATE series SET name=?, sort=? WHERE id=?",
-                        (ch["new"], ch["new"], ch["id"]),
+                        "UPDATE books SET title=?, sort=? WHERE id=?",
+                        (ch["new"], new_sort, ch["id"]),
                     )
 
-        conn.execute("COMMIT")
-        conn.close()
+            elif item_type == "tags":
+                # Tags table has a unique constraint on name — rename directly
+                for ch in changes:
+                    conn.execute(
+                        "UPDATE tags SET name=? WHERE id=?",
+                        (ch["new"], ch["id"]),
+                    )
+
+            elif item_type == "publishers":
+                # Publishers table has a unique constraint on name — rename directly
+                for ch in changes:
+                    conn.execute(
+                        "UPDATE publishers SET name=? WHERE id=?",
+                        (ch["new"], ch["id"]),
+                    )
+
+            elif item_type == "series":
+                for ch in changes:
+                    if ch["conflict_id"]:
+                        # Merge: move all books to existing series, delete old
+                        conn.execute(
+                            "UPDATE books_series_link SET series=? WHERE series=?",
+                            (ch["conflict_id"], ch["id"]),
+                        )
+                        conn.execute("DELETE FROM series WHERE id=?", (ch["id"],))
+                    else:
+                        conn.execute(
+                            "UPDATE series SET name=?, sort=? WHERE id=?",
+                            (ch["new"], ch["new"], ch["id"]),
+                        )
     except Exception as exc:
-        try:
-            conn.execute("ROLLBACK")
-            conn.close()
-        except Exception:
-            pass
         return {"status": "error", "message": str(exc)}
 
     result = {
@@ -767,23 +743,14 @@ def fix_series_numbers(
         }
 
     # ── Apply via direct SQLite (calibredb times out on large libraries) ────
-    db_path = str(backend.db_path)
     try:
-        conn = backend.connect_write(timeout=30)
-        conn.execute("BEGIN")
-        for ch in changes:
-            conn.execute(
-                "UPDATE books SET series_index=? WHERE id=?",
-                (ch["new_index"], ch["book_id"]),
-            )
-        conn.execute("COMMIT")
-        conn.close()
+        with backend.write_transaction(timeout=30) as conn:
+            for ch in changes:
+                conn.execute(
+                    "UPDATE books SET series_index=? WHERE id=?",
+                    (ch["new_index"], ch["book_id"]),
+                )
     except Exception as exc:
-        try:
-            conn.execute("ROLLBACK")
-            conn.close()
-        except Exception:
-            pass
         return {"status": "error", "message": str(exc), "series": series_name}
 
     return {
@@ -841,28 +808,18 @@ def rename_author(
 
     db_path = str(backend.db_path)
     try:
-        conn = backend.connect_write(timeout=15)
-        conn.execute("BEGIN")
-
-        conn.execute(
-            "UPDATE authors SET name=?, sort=? WHERE id=?",
-            (new_name, new_sort, author_id),
-        )
-        # Refresh the denormalised author_sort on all books by this author
-        conn.execute(
-            "UPDATE books SET author_sort=? "
-            "WHERE id IN (SELECT book FROM books_authors_link WHERE author=?)",
-            (new_sort, author_id),
-        )
-
-        conn.execute("COMMIT")
-        conn.close()
+        with backend.write_transaction(timeout=15) as conn:
+            conn.execute(
+                "UPDATE authors SET name=?, sort=? WHERE id=?",
+                (new_name, new_sort, author_id),
+            )
+            # Refresh the denormalised author_sort on all books by this author
+            conn.execute(
+                "UPDATE books SET author_sort=? "
+                "WHERE id IN (SELECT book FROM books_authors_link WHERE author=?)",
+                (new_sort, author_id),
+            )
     except Exception as exc:
-        try:
-            conn.execute("ROLLBACK")
-            conn.close()
-        except Exception:
-            pass
         return {"status": "error", "message": str(exc)}
 
     # Check if any affected books have multiple authors
@@ -960,23 +917,14 @@ def fix_author_sort(
         }
 
     # ── Apply via direct SQLite (calibredb times out on large libraries) ────
-    db_path = str(backend.db_path)
     try:
-        conn = backend.connect_write(timeout=30)
-        conn.execute("BEGIN")
-        for m in mismatches:
-            conn.execute(
-                "UPDATE books SET author_sort=? WHERE id=?",
-                (m["correct"], m["id"]),
-            )
-        conn.execute("COMMIT")
-        conn.close()
+        with backend.write_transaction(timeout=30) as conn:
+            for m in mismatches:
+                conn.execute(
+                    "UPDATE books SET author_sort=? WHERE id=?",
+                    (m["correct"], m["id"]),
+                )
     except Exception as exc:
-        try:
-            conn.execute("ROLLBACK")
-            conn.close()
-        except Exception:
-            pass
         return {"status": "error", "message": str(exc)}
 
     return {
@@ -996,24 +944,7 @@ def cleanup_orphan_links(
 
     WARNING: This writes directly to SQLite. Only use when Calibre is closed.
     """
-    link_tables = [
-        ("books_authors_link", "book"),
-        ("books_series_link", "book"),
-        ("books_tags_link", "book"),
-        ("books_publishers_link", "book"),
-        ("books_languages_link", "book"),
-        ("books_ratings_link", "book"),
-        ("books_pages_link", "book"),      # Count Pages plugin — has real FK constraint
-        ("books_plugin_data", "book"),     # Plugin metadata
-        ("data", "book"),
-        ("comments", "book"),
-        ("identifiers", "book"),
-        ("last_read_positions", "book"),   # Reading positions (per book/format/user/device)
-        ("annotations", "book"),           # Highlights, notes, bookmarks
-        ("annotations_dirtied", "book"),   # Calibre dirty-tracking for annotations
-        ("metadata_dirtied", "book"),      # Calibre dirty-tracking for metadata
-        ("conversion_options", "book"),    # Per-book conversion settings
-    ]
+    link_tables = BOOK_CHILD_TABLES
 
     # Count orphans and collect orphaned book IDs per table
     counts = {}
@@ -1078,15 +1009,8 @@ def find_orphaned_metadata(
     Args:
         dry_run: If True (default), only list orphans. If False, delete them.
     """
-    TABLES = [
-        ("authors",    "author",    "books_authors_link"),
-        ("series",     "series",    "books_series_link"),
-        ("tags",       "tag",       "books_tags_link"),
-        ("publishers", "publisher", "books_publishers_link"),
-    ]
-
     found: dict[str, list[str]] = {}
-    for table, link_col, link_table in TABLES:
+    for table, link_col, link_table in METADATA_TABLES:
         rows = backend.query_db(
             f"SELECT name FROM {table} "
             f"WHERE id NOT IN (SELECT {link_col} FROM {link_table}) "
@@ -1115,7 +1039,7 @@ def find_orphaned_metadata(
     try:
         conn = backend.connect_write(timeout=10)
         deleted: dict[str, int] = {}
-        for table, link_col, link_table in TABLES:
+        for table, link_col, link_table in METADATA_TABLES:
             if table in found:
                 cursor = conn.execute(
                     f"DELETE FROM {table} "

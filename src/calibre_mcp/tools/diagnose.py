@@ -4,6 +4,7 @@ import os
 from collections import defaultdict
 from typing import Any
 
+from ..backend import BOOK_CHILD_TABLES
 from ..utils.normalize import normalize_for_grouping, initials_compatible, parse_author_tokens
 from ..utils.titlecase import is_all_uppercase
 
@@ -370,27 +371,8 @@ def find_orphan_links(backend) -> dict[str, int]:
     Find orphan entries in link tables (book ID doesn't exist in books table).
     These cause FK constraint errors when Calibre tries to operate on them.
     """
-    link_tables = [
-        ("books_authors_link", "book"),
-        ("books_series_link", "book"),
-        ("books_tags_link", "book"),
-        ("books_publishers_link", "book"),
-        ("books_languages_link", "book"),
-        ("books_ratings_link", "book"),
-        ("books_pages_link", "book"),
-        ("books_plugin_data", "book"),
-        ("data", "book"),
-        ("comments", "book"),
-        ("identifiers", "book"),
-        ("last_read_positions", "book"),
-        ("annotations", "book"),
-        ("annotations_dirtied", "book"),
-        ("metadata_dirtied", "book"),
-        ("conversion_options", "book"),
-    ]
-
     results = {}
-    for table, col in link_tables:
+    for table, col in BOOK_CHILD_TABLES:
         count = backend.query_db_scalar(f"""
             SELECT COUNT(*) FROM {table} t
             WHERE NOT EXISTS (SELECT 1 FROM books b WHERE b.id = t.{col})
