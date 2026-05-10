@@ -12,7 +12,7 @@ from mcp.types import Tool, TextContent
 
 from .backend import CalibreBackend, CalibreError
 from .config import Config
-from .tools import query, diagnose, write, bulk, report, epub
+from .tools import query, diagnose, write, bulk, report, epub, analyze
 
 
 # ── Server identity (captured at import time = process start) ──────────
@@ -734,6 +734,81 @@ TOOLS = [
             "required": ["old_stats"],
         },
     ),
+
+    # ── Workflow tools (compose lower-level tools into one-shot answers) ──
+    Tool(
+        name="next_author_to_process",
+        description=(
+            "Return the next N authors that haven't been logged in calibre-hecho.md yet, "
+            "sorted by descending book count. Use this at the start of a cleanup session "
+            "instead of guessing which author to process. Skips authors already recorded "
+            "in the progress file (matched by normalized name)."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "min_books": {"type": "integer", "default": 10,
+                              "description": "Skip authors with fewer than this many books."},
+                "limit": {"type": "integer", "default": 5,
+                          "description": "Number of candidates to return."},
+                "hecho_path": {"type": "string",
+                               "description": "Override path to calibre-hecho.md (defaults to ~/claude/calibre-hecho.md)."},
+            },
+        },
+    ),
+    Tool(
+        name="find_compilation_coverage",
+        description=(
+            "Detect which of an author's individual works are covered by their compilation "
+            "EPUBs. Picks compilation candidates by size or title keywords, extracts each TOC, "
+            "skips likely scan-EPUBs, and matches individual book titles against TOC entries "
+            "(accent-insensitive substring match). Use BEFORE proposing deletions of works "
+            "that may already be in a recopilatorio."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "author_id": {"type": "integer", "description": "The author whose books to analyze."},
+                "min_compilation_kb": {"type": "integer", "default": 200,
+                                       "description": "EPUBs larger than this (KB) are treated as compilation candidates."},
+            },
+            "required": ["author_id"],
+        },
+    ),
+    Tool(
+        name="suggest_dedup_resolution",
+        description=(
+            "Given a duplicate group of book IDs, pick which to keep using a deterministic "
+            "quality score: format rank (EPUB > FB2 > PRC > …) → has cover → has comments → "
+            "file size → most recent. Returns the suggested keep, the deletes, and the "
+            "decisive reason. Caller MUST still confirm with the user before deleting."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "book_ids": {"type": "array", "items": {"type": "integer"},
+                             "description": "Two or more book IDs that are suspected duplicates."},
+            },
+            "required": ["book_ids"],
+        },
+    ),
+    Tool(
+        name="analyze_author",
+        description=(
+            "Mega-tool: full cleanup analysis of one author in a single call. Composes "
+            "find_compilation_coverage + duplicate detection + suggest_dedup_resolution + "
+            "similar-named author detection + series gap analysis + metadata gap counts, "
+            "and returns a prioritized action list. Use this as the FIRST call when starting "
+            "to work on an author — it replaces ~10 SQL queries and reduces back-and-forth."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "author_id": {"type": "integer", "description": "The author to analyze."},
+            },
+            "required": ["author_id"],
+        },
+    ),
 ]
 
 # Apply permissive schemas so Claude Code's client accepts string-typed params
@@ -884,6 +959,16 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
                 return [TextContent(type="text", text=report.generate_report(backend))]
             case "compare_snapshots":
                 return _json_response(report.compare_snapshots(backend, **arguments))
+
+            # Workflow
+            case "next_author_to_process":
+                return _json_response(analyze.next_author_to_process(backend, **arguments))
+            case "find_compilation_coverage":
+                return _json_response(analyze.find_compilation_coverage(backend, **arguments))
+            case "suggest_dedup_resolution":
+                return _json_response(analyze.suggest_dedup_resolution(backend, **arguments))
+            case "analyze_author":
+                return _json_response(analyze.analyze_author(backend, **arguments))
 
             case _:
                 return _error_response(f"Unknown tool: {name}")

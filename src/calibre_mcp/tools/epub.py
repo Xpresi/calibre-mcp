@@ -10,6 +10,8 @@ import re
 import zipfile
 from typing import Any
 
+from . import _toc_cache
+
 
 # Patterns that suggest a TOC entry is a generic page/scan marker
 # rather than a real chapter/work title.
@@ -113,12 +115,18 @@ def _detect_scan_signals(
     return signals
 
 
-def get_epub_toc(backend, book_id: int) -> dict[str, Any]:
+def get_epub_toc(backend, book_id: int, use_cache: bool = True) -> dict[str, Any]:
     """Extract TOC from an EPUB book and detect scan-EPUB signals.
 
     Returns metadata, the TOC entries (truncated at 500), and heuristic flags
     for scan detection. Useful before deleting individual works that may be
     covered by a recopilatorio.
+
+    Caching: results are stored in a sidecar SQLite DB inside the library
+    folder (`_calibre_mcp_toc_cache.db`), keyed by (book_id, mtime, file_size).
+    Set use_cache=False to force re-extraction (e.g. after editing the EPUB).
+    Cache hits skip the zip/regex work entirely — useful when running
+    find_compilation_coverage repeatedly across sessions.
     """
     rows = backend.query_db(
         """
@@ -166,17 +174,33 @@ def get_epub_toc(backend, book_id: int) -> dict[str, Any]:
             "message": "EPUB file not found on disk.",
         }
 
-    toc_entries, source = _extract_toc_entries(epub_path)
+    cache_hit = False
+    if use_cache:
+        cached = _toc_cache.get_cached(backend.library, int(book_id), epub_path)
+        if cached is not None:
+            cache_hit = True
+            toc_entries = cached["toc"]
+            source = cached["toc_source"]
+            signals = cached["scan_signals"]
+            is_likely_scan = cached["is_likely_scan"]
+
+    if not cache_hit:
+        toc_entries, source = _extract_toc_entries(epub_path)
+        signals = _detect_scan_signals(title, size_mb, toc_entries)
+        is_likely_scan = len(signals) >= 2 or (
+            len(signals) == 1 and any("toc_pattern:generic" in s for s in signals)
+        )
+        # Persist before truncation so a future invocation can serve the full set.
+        if use_cache:
+            _toc_cache.store(
+                backend.library, int(book_id), epub_path,
+                toc_entries, source, is_likely_scan, signals,
+            )
 
     truncated = False
     if len(toc_entries) > _MAX_TOC_ENTRIES:
         toc_entries = toc_entries[:_MAX_TOC_ENTRIES]
         truncated = True
-
-    signals = _detect_scan_signals(title, size_mb, toc_entries)
-    is_likely_scan = len(signals) >= 2 or (
-        len(signals) == 1 and any("toc_pattern:generic" in s for s in signals)
-    )
 
     return {
         "status": "success",
@@ -191,4 +215,5 @@ def get_epub_toc(backend, book_id: int) -> dict[str, Any]:
         "toc_truncated": truncated,
         "is_likely_scan": is_likely_scan,
         "scan_signals": signals,
+        "cache_hit": cache_hit,
     }
