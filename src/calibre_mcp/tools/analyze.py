@@ -245,13 +245,29 @@ def find_compilation_coverage(
         if _is_compilation_candidate(info["title"], epub_fmt["size_kb"]):
             candidates.append((bid, info["title"], epub_fmt["size_kb"]))
 
-    # Extract TOC from each candidate (cap to avoid timeout on huge authors)
+    # Extract TOC from each candidate (cap to avoid timeout on huge authors).
+    # Sort: keyword matches first (high signal — "obras completas", "antología"),
+    # then by size descending. This prevents a real but small anthology from
+    # being dropped while large novels eat the cap (the "Varios" case).
+    keyword_match_count = sum(
+        1 for _, t, _ in candidates if _COMPILATION_KEYWORDS.search(t or "")
+    )
+    candidates_total = len(candidates)
+    candidates = sorted(
+        candidates,
+        key=lambda x: (
+            bool(_COMPILATION_KEYWORDS.search(x[1] or "")),  # True > False
+            x[2],                                             # size_kb desc
+        ),
+        reverse=True,
+    )
+    compilations_capped = candidates_total > max_compilations
+    candidates_dropped = max(0, candidates_total - max_compilations)
+    if compilations_capped:
+        candidates = candidates[:max_compilations]
+
     compilations: list[dict[str, Any]] = []
     skipped_scans = 0
-    compilations_capped = len(candidates) > max_compilations
-    if compilations_capped:
-        # Prioritise largest files — most likely to be real anthologies
-        candidates = sorted(candidates, key=lambda x: x[2], reverse=True)[:max_compilations]
     for bid, title, size_kb in candidates:
         toc_result = epub_tools.get_epub_toc(backend, bid)
         if toc_result.get("status") != "success":
@@ -337,7 +353,10 @@ def find_compilation_coverage(
             "total_books": len(by_book),
             "compilation_count": len(compilations),
             "compilation_skipped_scans": skipped_scans,
-            "compilations_capped": compilations_capped,  # True if >max_compilations were found
+            "compilations_capped": compilations_capped,         # True if >max_compilations were found
+            "candidates_total": candidates_total,                # all candidates before cap
+            "candidates_keyword_matched": keyword_match_count,   # title-keyword hits (high signal)
+            "candidates_dropped_by_cap": candidates_dropped,     # how many we didn't extract
             "covered_count": covered_count,
             "uncovered_count": len(individual_books) - covered_count,
         },
