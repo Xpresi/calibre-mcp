@@ -170,6 +170,7 @@ def find_compilation_coverage(
     backend,
     author_id: int,
     min_compilation_kb: int = _DEFAULT_COMPILATION_MIN_KB,
+    max_compilations: int = 50,
 ) -> dict[str, Any]:
     """Detect which of an author's individual works are covered by their compilations.
 
@@ -244,9 +245,13 @@ def find_compilation_coverage(
         if _is_compilation_candidate(info["title"], epub_fmt["size_kb"]):
             candidates.append((bid, info["title"], epub_fmt["size_kb"]))
 
-    # Extract TOC from each candidate
+    # Extract TOC from each candidate (cap to avoid timeout on huge authors)
     compilations: list[dict[str, Any]] = []
     skipped_scans = 0
+    compilations_capped = len(candidates) > max_compilations
+    if compilations_capped:
+        # Prioritise largest files — most likely to be real anthologies
+        candidates = sorted(candidates, key=lambda x: x[2], reverse=True)[:max_compilations]
     for bid, title, size_kb in candidates:
         toc_result = epub_tools.get_epub_toc(backend, bid)
         if toc_result.get("status") != "success":
@@ -332,6 +337,7 @@ def find_compilation_coverage(
             "total_books": len(by_book),
             "compilation_count": len(compilations),
             "compilation_skipped_scans": skipped_scans,
+            "compilations_capped": compilations_capped,  # True if >max_compilations were found
             "covered_count": covered_count,
             "uncovered_count": len(individual_books) - covered_count,
         },
@@ -653,12 +659,23 @@ def analyze_author(
     if not actions:
         actions.append("CLEAN: no actionable issues detected for this author")
 
+    # Only return individual books that need attention: covered by a compilation
+    # or part of a duplicate group. Clean uncovered books are summarised by count
+    # to avoid token-overflow on large authors (400+ books).
+    dup_ids: set[int] = {bid for g in duplicate_groups for bid in g["book_ids"]}
+    notable_books = [
+        b for b in coverage["individual_books"]
+        if b["covered_by"] or b["book_id"] in dup_ids
+    ]
+    skipped_clean = len(coverage["individual_books"]) - len(notable_books)
+
     return {
         "status": "success",
         "author": {"id": a["id"], "name": a["name"], "sort": a["sort"]},
         "summary": coverage["summary"],
         "compilations": coverage["compilations"],
-        "individual_books": coverage["individual_books"],
+        "individual_books": notable_books,
+        "individual_books_skipped_clean": skipped_clean,  # uncovered + no dups — nothing to do
         "duplicate_groups": duplicate_groups,
         "similar_named_authors": similar_authors,
         "series_gaps": series_gaps,
