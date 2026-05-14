@@ -14,6 +14,7 @@ from calibre_mcp.tools.analyze import (
     _is_compilation_candidate,
     _is_meaningful_toc_entry,
     _title_matches_toc_entry,
+    _title_match_kind,
     suggest_dedup_resolution,
 )
 
@@ -494,3 +495,118 @@ class TestDedupTieBreak:
         backend = self._backend(books)
         result = suggest_dedup_resolution(backend, [42, 5, 17])
         assert result["keep"]["id"] == 5
+
+
+# ── Confidence levels (#3 dedup divergence resolution) ──────────────────
+
+class TestTitleMatchKind:
+    """The matcher distinguishes exact (safe to delete) from partial (review)."""
+
+    def test_exact_after_normalization(self):
+        # "El Chacal" and "el chacal" both normalize to "chacal" → exact
+        assert _title_match_kind("chacal", "chacal") == "exact"
+
+    def test_substring_partial(self):
+        # 18-char title contains 5-char entry but ratio works → partial
+        # entry='crimen y castigo' (16) in tnorm='crimen y castigo a' (18) = 16/18 = 0.89
+        assert _title_match_kind("crimen y castigo a", "crimen y castigo") == "partial"
+
+    def test_no_match(self):
+        assert _title_match_kind("uno", "dos") is None
+
+    def test_short_title_in_long_entry_below_ratio(self):
+        # The Steel-paris regression — short entry, long title, ratio fails
+        assert _title_match_kind("una mujer en paris", "paris") is None
+
+
+class TestCoverageConfidenceSplit:
+    """find_compilation_coverage must split exact and partial matches into separate buckets."""
+
+    def _make_backend(self, books_rows, toc_for):
+        from calibre_mcp.tools import epub as epub_tools
+
+        def query_db(sql, params=None):
+            return list(books_rows)
+
+        def fake_get_toc(backend, bid, **kw):
+            return {
+                "status": "success",
+                "is_likely_scan": False,
+                "toc": toc_for.get(int(bid), []),
+                "toc_count": len(toc_for.get(int(bid), [])),
+                "size_mb": 1.0,
+            }
+
+        original = epub_tools.get_epub_toc
+        epub_tools.get_epub_toc = fake_get_toc
+        backend = SimpleNamespace(query_db=query_db, library="/lib")
+        return backend, original
+
+    def test_exact_match_lands_in_exact_bucket(self):
+        from calibre_mcp.tools import epub as epub_tools
+        from calibre_mcp.tools.analyze import find_compilation_coverage
+
+        books = [
+            {"id": 1, "title": "Antología", "format": "EPUB", "uncompressed_size": 5_000_000},
+            {"id": 2, "title": "El Chacal", "format": "EPUB", "uncompressed_size": 50_000},
+        ]
+        toc_for = {1: ["El Chacal"]}
+        backend, original = self._make_backend(books, toc_for)
+        try:
+            result = find_compilation_coverage(backend, author_id=1)
+        finally:
+            epub_tools.get_epub_toc = original
+
+        comp = next(c for c in result["compilations"] if c["book_id"] == 1)
+        assert 2 in comp["covered_exact_ids"]
+        assert 2 not in comp["covered_partial_ids"]
+        assert result["summary"]["covered_exact_count"] == 1
+        assert result["summary"]["covered_partial_only_count"] == 0
+
+    def test_partial_match_lands_in_partial_bucket(self):
+        from calibre_mcp.tools import epub as epub_tools
+        from calibre_mcp.tools.analyze import find_compilation_coverage
+
+        # Title has subtitle/extra text vs the bare TOC entry — ratio passes
+        # but it's not exact, so it must go to partial.
+        books = [
+            {"id": 1, "title": "Antología", "format": "EPUB", "uncompressed_size": 5_000_000},
+            {"id": 2, "title": "Don Quijote", "format": "EPUB", "uncompressed_size": 50_000},
+        ]
+        # entry "Don Quijote, primera parte" — partial substring of title? Actually
+        # tnorm='don quijote' (11), entry='don quijote primera parte' (25). 11/25 = 0.44 → no.
+        # Reverse direction also no. Need to construct a real partial match:
+        # entry "Don Quijote anotado" (19), tnorm='don quijote' (11). 11/19 = 0.58 → no.
+        # entry "Don Quijoter" (12), tnorm='don quijote' (11): 11/12 = 0.92 → partial.
+        toc_for = {1: ["Don Quijoter"]}
+        backend, original = self._make_backend(books, toc_for)
+        try:
+            result = find_compilation_coverage(backend, author_id=1)
+        finally:
+            epub_tools.get_epub_toc = original
+
+        comp = next(c for c in result["compilations"] if c["book_id"] == 1)
+        assert 2 in comp["covered_partial_ids"]
+        assert 2 not in comp["covered_exact_ids"]
+        assert result["summary"]["covered_partial_only_count"] == 1
+
+    def test_book_with_both_exact_and_partial_counts_as_exact_only(self):
+        """If the same book matches one TOC entry exactly and another partially,
+        it must count as 'exact' (safe), not as partial-only-needs-review."""
+        from calibre_mcp.tools import epub as epub_tools
+        from calibre_mcp.tools.analyze import find_compilation_coverage
+
+        books = [
+            {"id": 1, "title": "Antología", "format": "EPUB", "uncompressed_size": 5_000_000},
+            {"id": 2, "title": "El Chacal", "format": "EPUB", "uncompressed_size": 50_000},
+        ]
+        toc_for = {1: ["El Chacal", "el chacalero"]}  # exact + partial
+        backend, original = self._make_backend(books, toc_for)
+        try:
+            result = find_compilation_coverage(backend, author_id=1)
+        finally:
+            epub_tools.get_epub_toc = original
+
+        comp = next(c for c in result["compilations"] if c["book_id"] == 1)
+        assert 2 in comp["covered_exact_ids"]
+        assert result["summary"]["covered_partial_only_count"] == 0

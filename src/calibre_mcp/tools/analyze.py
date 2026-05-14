@@ -219,23 +219,46 @@ def _is_meaningful_toc_entry(entry: str) -> bool:
     return True
 
 
-def _title_matches_toc_entry(tnorm: str, entry: str) -> bool:
-    """True if a normalized title and TOC entry are the same work.
+def _title_match_kind(tnorm: str, entry: str) -> str | None:
+    """Classify how confidently a normalized title and TOC entry are the same work.
 
-    Two acceptance directions, both gated by _MIN_COVERAGE_RATIO so neither
-    party can be a tiny fragment of the other:
-      (a) tnorm ⊆ entry  → len(tnorm) / len(entry) ≥ 0.75
-      (b) entry ⊆ tnorm  → len(entry) / len(tnorm) ≥ 0.75
+    Returns one of:
+      "exact"   — normalized strings are identical. Safe basis for proposing
+                  deletion of the standalone copy: there is no ambiguity that
+                  the work appears in the compilation.
+      "partial" — substring match in either direction with character ratio
+                  ≥ _MIN_COVERAGE_RATIO. This catches subtitled/edition
+                  variants ("Don Quijote" vs "Don Quijote: edición anotada")
+                  but it ALSO catches dangerous near-misses ("Don Quijote"
+                  vs "Don Quijote, primera parte" — different works if the
+                  first is the omnibus and the second is just vol. I).
+                  Surfaced for human review; never used as auto-recommendation.
+      None      — not a match.
+
+    Both directions of substring containment require the same coverage
+    ratio (≥ 75 %) — symmetry matters because asymmetric checks let
+    short common TOC entries match arbitrary long titles:
+
+      tnorm = "una mujer en parís"   (18 chars)
+      entry = "parís"                ( 5 chars)   → entry in tnorm
+
+    Without the ratio on this direction, every Steel novel mentioning
+    "París" would be marked as covered by an unrelated TOC.
 
     Both inputs must already be passed through `_normalize_title_for_match`.
-    Hoisted out of the inner loop so the closure can't accidentally capture
-    a stale `tnorm` if anyone refactors the call site.
     """
+    if tnorm == entry:
+        return "exact"
     if tnorm in entry:
-        return len(tnorm) / len(entry) >= _MIN_COVERAGE_RATIO
+        return "partial" if len(tnorm) / len(entry) >= _MIN_COVERAGE_RATIO else None
     if entry in tnorm and len(entry) >= _MIN_MATCH_LEN:
-        return len(entry) / len(tnorm) >= _MIN_COVERAGE_RATIO
-    return False
+        return "partial" if len(entry) / len(tnorm) >= _MIN_COVERAGE_RATIO else None
+    return None
+
+
+def _title_matches_toc_entry(tnorm: str, entry: str) -> bool:
+    """Backward-compatible boolean wrapper around _title_match_kind."""
+    return _title_match_kind(tnorm, entry) is not None
 
 
 # Title fragments that strongly suggest a book is a compilation/anthology.
@@ -377,6 +400,8 @@ def find_compilation_coverage(
                 "skipped": toc_result.get("message", "TOC extraction failed"),
                 "covered_book_ids": [],
                 "covered_titles": [],
+                "covered_exact_ids": [],
+                "covered_partial_ids": [],
             })
             continue
 
@@ -390,6 +415,8 @@ def find_compilation_coverage(
                 "skipped": "likely_scan: " + ",".join(toc_result.get("scan_signals", [])),
                 "covered_book_ids": [],
                 "covered_titles": [],
+                "covered_exact_ids": [],
+                "covered_partial_ids": [],
             })
             continue
 
@@ -401,8 +428,14 @@ def find_compilation_coverage(
             if _is_meaningful_toc_entry(_normalize_title_for_match(t))
         ]
 
+        # Track every match by confidence — "exact" is safe to recommend for
+        # deletion; "partial" needs human review (a partial substring like
+        # "Don Quijote" ⊆ "Don Quijote, primera parte" might be the same work
+        # OR a different volume of the same series — the matcher can't tell).
         covered_ids: list[int] = []
         covered_titles: list[str] = []
+        covered_exact_ids: list[int] = []
+        covered_partial_ids: list[int] = []
         for other_bid, other_info in by_book.items():
             if other_bid == bid:
                 continue
@@ -411,9 +444,23 @@ def find_compilation_coverage(
             # Single words ("infinito", "chacal") match too many TOC entries.
             if not tnorm or len(tnorm) < _MIN_MATCH_LEN:
                 continue
-            if any(_title_matches_toc_entry(tnorm, e) for e in toc_norm):
-                covered_ids.append(other_bid)
-                covered_titles.append(other_info["title"])
+            # The strongest match across all TOC entries decides the bucket.
+            best_kind: str | None = None
+            for e in toc_norm:
+                kind = _title_match_kind(tnorm, e)
+                if kind == "exact":
+                    best_kind = "exact"
+                    break  # can't beat exact
+                if kind == "partial" and best_kind is None:
+                    best_kind = "partial"
+            if best_kind is None:
+                continue
+            covered_ids.append(other_bid)
+            covered_titles.append(other_info["title"])
+            if best_kind == "exact":
+                covered_exact_ids.append(other_bid)
+            else:
+                covered_partial_ids.append(other_bid)
 
         compilations.append({
             "book_id": bid,
@@ -423,13 +470,21 @@ def find_compilation_coverage(
             "skipped": None,
             "covered_book_ids": covered_ids,
             "covered_titles": covered_titles,
+            "covered_exact_ids": covered_exact_ids,        # safe to recommend deletion
+            "covered_partial_ids": covered_partial_ids,    # need human review
         })
 
-    # Build per-book "covered_by" reverse index
+    # Build per-book "covered_by" reverse index, splitting confidence levels.
     covered_by: dict[int, list[int]] = {}
+    covered_by_exact: dict[int, list[int]] = {}
+    covered_by_partial: dict[int, list[int]] = {}
     for c in compilations:
         for cid in c["covered_book_ids"]:
             covered_by.setdefault(cid, []).append(c["book_id"])
+        for cid in c["covered_exact_ids"]:
+            covered_by_exact.setdefault(cid, []).append(c["book_id"])
+        for cid in c["covered_partial_ids"]:
+            covered_by_partial.setdefault(cid, []).append(c["book_id"])
 
     individual_books: list[dict[str, Any]] = []
     compilation_ids = {c["book_id"] for c in compilations}
@@ -443,9 +498,18 @@ def find_compilation_coverage(
             "format": primary_format["format"],
             "size_kb": primary_format["size_kb"],
             "covered_by": covered_by.get(bid, []),
+            "covered_by_exact": covered_by_exact.get(bid, []),     # safe-to-delete sources
+            "covered_by_partial": covered_by_partial.get(bid, []), # review-only sources
         })
 
     covered_count = sum(1 for b in individual_books if b["covered_by"])
+    covered_exact_count = sum(1 for b in individual_books if b["covered_by_exact"])
+    # Partial-only = books whose only coverage source is a partial match
+    # (no exact match anywhere). These are the ones that REQUIRE human review.
+    covered_partial_only_count = sum(
+        1 for b in individual_books
+        if b["covered_by_partial"] and not b["covered_by_exact"]
+    )
 
     return {
         "author_id": int(author_id),
@@ -460,7 +524,9 @@ def find_compilation_coverage(
             "candidates_keyword_matched": keyword_match_count,   # title-keyword hits (high signal)
             "candidates_dropped_by_cap": candidates_dropped,     # how many we didn't extract
             "candidates_dropped_titles": candidates_dropped_titles,  # up to 10 titles excluded
-            "covered_count": covered_count,
+            "covered_count": covered_count,                          # any confidence (backward compat)
+            "covered_exact_count": covered_exact_count,              # safe to recommend deletion
+            "covered_partial_only_count": covered_partial_only_count,  # MUST be reviewed manually
             "uncovered_count": len(individual_books) - covered_count,
         },
     }
@@ -767,11 +833,25 @@ def analyze_author(
         actions.append(
             f"DEDUP: {len(duplicate_groups)} duplicate title group(s) — review suggestions below"
         )
-    if coverage["summary"]["covered_count"]:
+    # Coverage actions are split by confidence so the caller never proposes
+    # deleting a book whose match is uncertain. Exact = safe to delete after
+    # the usual dry_run + Regla 7 verification. Partial-only = MUST verify
+    # the TOC manually first; the matcher cannot rule out series volumes
+    # ("Don Quijote" vs "Don Quijote, primera parte" both look like coverage
+    # but only the omnibus actually contains both).
+    exact_n = coverage["summary"]["covered_exact_count"]
+    partial_only_n = coverage["summary"]["covered_partial_only_count"]
+    if exact_n:
         actions.append(
-            f"COMPILATION COVERAGE: {coverage['summary']['covered_count']} individual book(s) "
-            f"covered by {coverage['summary']['compilation_count']} compilation(s) — "
-            f"consider deleting covered after verification"
+            f"COMPILATION COVERAGE (safe): {exact_n} individual book(s) with EXACT title "
+            f"match in a compilation TOC — proceed with dry_run + Regla 7 to delete."
+        )
+    if partial_only_n:
+        actions.append(
+            f"COMPILATION COVERAGE (REVIEW): {partial_only_n} individual book(s) with only "
+            f"PARTIAL title match — could be the same work or a different volume of the "
+            f"same series. Inspect each TOC manually before any deletion. See "
+            f"individual_books[].covered_by_partial."
         )
     if series_gaps:
         actions.append(
