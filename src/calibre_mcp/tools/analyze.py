@@ -147,6 +147,40 @@ def _normalize_title_for_match(s: str) -> str:
 
 # ── #2: compilation coverage ───────────────────────────────────────────────
 
+# TOC entries that are structural headings, not work titles. Matching against
+# these causes massive false positives ("CAPÍTULO I" matching title "El capitán").
+_CHAPTER_HEADING_RE = re.compile(
+    r"^(cap[íi]tulo|chapter|parte\s+\w*|secci[oó]n|section|"
+    r"pr[oó]logo|ep[íi]logo|introducci[oó]n|introduction|"
+    r"ap[eé]ndice|appendix|fin$|end$|inicio$|start$|"
+    r"[\*\-–—]+$|\.{2,}$|\d+[\.\-\)]?\s*$)",
+    re.IGNORECASE,
+)
+
+# Minimum character length for a normalized title/TOC entry to participate in
+# matching. Purely cosmetic lower bound — the ratio check below does the real work.
+_MIN_MATCH_LEN = 4
+
+# When a title is a substring of a TOC entry, require that the title covers at
+# least this fraction of the TOC entry's length. This prevents "el chacal"
+# (9 chars) from matching "el reto del chacal" (18 chars) — ratio 0.50 < 0.75.
+# But "el chacal" still matches a TOC entry "el chacal" exactly (ratio 1.0).
+_MIN_COVERAGE_RATIO = 0.75
+
+
+def _is_meaningful_toc_entry(entry: str) -> bool:
+    """Return True if a TOC entry looks like a real title, not a chapter heading."""
+    if not entry or len(entry) < _MIN_MATCH_LEN:
+        return False
+    if _CHAPTER_HEADING_RE.match(entry):
+        return False
+    # Reject entries that are purely numeric or punctuation after stripping spaces
+    stripped = entry.replace(" ", "")
+    if stripped.isdigit() or not any(c.isalpha() for c in stripped):
+        return False
+    return True
+
+
 # Title fragments that strongly suggest a book is a compilation/anthology.
 _COMPILATION_KEYWORDS = re.compile(
     r"\b(obras?\s+completas?|narrativa\s+completa|cuentos?\s+completos?|"
@@ -295,9 +329,13 @@ def find_compilation_coverage(
             })
             continue
 
-        # Pre-normalize TOC entries once for matching
-        toc_norm = [_normalize_title_for_match(t) for t in toc_result.get("toc", [])]
-        toc_norm_str = " | ".join(toc_norm)  # joined with separators to use substring match
+        # Pre-normalize TOC entries once for matching; filter structural headings
+        # (CAPÍTULO I, * * *, FIN, etc.) that cause massive false positives.
+        toc_norm = [
+            _normalize_title_for_match(t)
+            for t in toc_result.get("toc", [])
+            if _is_meaningful_toc_entry(_normalize_title_for_match(t))
+        ]
 
         covered_ids: list[int] = []
         covered_titles: list[str] = []
@@ -305,11 +343,27 @@ def find_compilation_coverage(
             if other_bid == bid:
                 continue
             tnorm = _normalize_title_for_match(other_info["title"])
-            if not tnorm or len(tnorm) < 4:  # skip too-short titles (false positives)
+            # Require the title to be long enough to be unambiguous.
+            # Single words ("infinito", "chacal") match too many TOC entries.
+            if not tnorm or len(tnorm) < _MIN_MATCH_LEN:
                 continue
-            # Match if any TOC entry contains the normalized title
-            # (covers "El cuento" matching TOC entry "El cuento de los caballos")
-            if any(tnorm in entry or entry in tnorm for entry in toc_norm if entry):
+            # A book is "covered" if any meaningful TOC entry matches its title.
+            #
+            # Two match modes:
+            #   (a) title ⊆ TOC entry: valid only if the title covers ≥ 75% of the
+            #       entry's length (prevents "el chacal" matching "el reto del chacal").
+            #       Short titles can still match if the TOC entry is equally short
+            #       (exact or near-exact match).
+            #   (b) TOC entry ⊆ title: the entry must be ≥ MIN_MATCH_LEN chars so
+            #       that single words don't trigger a match.
+            def _matches(entry: str) -> bool:
+                if tnorm in entry:
+                    return len(tnorm) / len(entry) >= _MIN_COVERAGE_RATIO
+                if entry in tnorm and len(entry) >= _MIN_MATCH_LEN:
+                    return True
+                return False
+
+            if any(_matches(entry) for entry in toc_norm):
                 covered_ids.append(other_bid)
                 covered_titles.append(other_info["title"])
 
