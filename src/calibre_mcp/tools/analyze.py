@@ -43,6 +43,10 @@ _HECHO_TABLE_HEADERS = {
     "autor", "author", "name", "nombre",
 }
 
+# Sentinel used to preserve escaped pipes (\|) through the regex split.
+# Author names rarely contain pipes, but markdown notes occasionally do.
+_ESCAPED_PIPE_SENTINEL = "\x00ESCAPED_PIPE\x00"
+
 
 def _read_processed_authors(path: Path) -> set[str]:
     """Return the set of normalized author names already logged in calibre-hecho.md.
@@ -71,9 +75,12 @@ def _read_processed_authors(path: Path) -> set[str]:
                 # blocks `-`, but explicit guard makes intent obvious.
                 if stripped.startswith("|") and "---" in stripped:
                     continue
-                m = _HECHO_LINE_RE.match(line)
+                # Preserve escaped pipes (`\|` in markdown notes) so they don't
+                # split the cell early. Restored after the regex matches.
+                protected = line.replace(r"\|", _ESCAPED_PIPE_SENTINEL)
+                m = _HECHO_LINE_RE.match(protected)
                 if m:
-                    candidate = m.group(1).strip()
+                    candidate = m.group(1).replace(_ESCAPED_PIPE_SENTINEL, "|").strip()
                     if candidate.lower() in _HECHO_TABLE_HEADERS:
                         continue  # skip "| Autor | Libros | ... |" header rows
                     processed.add(normalize_for_grouping(candidate))
@@ -152,6 +159,14 @@ def _normalize_title_for_match(s: str) -> str:
 
     Strips accents, articles, punctuation, common suffixes, and lowercases.
     'El Capitán de Salgari' and 'capitan salgari' produce the same key.
+
+    NOTE: this is intentionally MORE aggressive than `_calibre_title_sort`
+    in backend.py — Calibre's title_sort respects the book's `language` to
+    decide which articles to strip (only ES-only articles for Spanish books,
+    only EN-only for English ones). The matcher strips both lists at once
+    so a TOC entry "Le Voyage" still matches a book titled "Voyage" even
+    when the EPUB is filed under language=fr. Rule of thumb: the matcher
+    is for fuzzy "are these the same work?" comparisons, not for sorting.
     """
     if not s:
         return ""
@@ -202,6 +217,25 @@ def _is_meaningful_toc_entry(entry: str) -> bool:
     if stripped.isdigit() or not any(c.isalpha() for c in stripped):
         return False
     return True
+
+
+def _title_matches_toc_entry(tnorm: str, entry: str) -> bool:
+    """True if a normalized title and TOC entry are the same work.
+
+    Two acceptance directions, both gated by _MIN_COVERAGE_RATIO so neither
+    party can be a tiny fragment of the other:
+      (a) tnorm ⊆ entry  → len(tnorm) / len(entry) ≥ 0.75
+      (b) entry ⊆ tnorm  → len(entry) / len(tnorm) ≥ 0.75
+
+    Both inputs must already be passed through `_normalize_title_for_match`.
+    Hoisted out of the inner loop so the closure can't accidentally capture
+    a stale `tnorm` if anyone refactors the call site.
+    """
+    if tnorm in entry:
+        return len(tnorm) / len(entry) >= _MIN_COVERAGE_RATIO
+    if entry in tnorm and len(entry) >= _MIN_MATCH_LEN:
+        return len(entry) / len(tnorm) >= _MIN_COVERAGE_RATIO
+    return False
 
 
 # Title fragments that strongly suggest a book is a compilation/anthology.
@@ -320,6 +354,13 @@ def find_compilation_coverage(
     )
     compilations_capped = candidates_total > max_compilations
     candidates_dropped = max(0, candidates_total - max_compilations)
+    # Capture the titles dropped by the cap so the caller can decide whether
+    # they want to re-run with a higher max_compilations. We expose at most
+    # 10 titles to keep the response small.
+    candidates_dropped_titles: list[str] = (
+        [t for _, t, _ in candidates[max_compilations:max_compilations + 10]]
+        if compilations_capped else []
+    )
     if compilations_capped:
         candidates = candidates[:max_compilations]
 
@@ -370,29 +411,7 @@ def find_compilation_coverage(
             # Single words ("infinito", "chacal") match too many TOC entries.
             if not tnorm or len(tnorm) < _MIN_MATCH_LEN:
                 continue
-            # A book is "covered" if any meaningful TOC entry matches its title.
-            # Both directions of substring containment require the same coverage
-            # ratio (≥ 75 %) — symmetry matters because asymmetric checks let
-            # short common TOC entries match arbitrary long titles:
-            #
-            #   tnorm = "una mujer en parís"   (18 chars)
-            #   entry = "parís"                ( 5 chars)   → entry in tnorm
-            #
-            # Without the ratio on this direction, every Steel novel mentioning
-            # "París" would be marked as covered by an unrelated TOC.
-            #
-            # Cases now allowed:
-            #   (a) title ⊆ TOC entry:  len(title) / len(entry) ≥ 0.75
-            #   (b) TOC entry ⊆ title:  len(entry) / len(title) ≥ 0.75
-            # Exact matches (ratio = 1.0) keep working in both directions.
-            def _matches(entry: str) -> bool:
-                if tnorm in entry:
-                    return len(tnorm) / len(entry) >= _MIN_COVERAGE_RATIO
-                if entry in tnorm and len(entry) >= _MIN_MATCH_LEN:
-                    return len(entry) / len(tnorm) >= _MIN_COVERAGE_RATIO
-                return False
-
-            if any(_matches(entry) for entry in toc_norm):
+            if any(_title_matches_toc_entry(tnorm, e) for e in toc_norm):
                 covered_ids.append(other_bid)
                 covered_titles.append(other_info["title"])
 
@@ -440,6 +459,7 @@ def find_compilation_coverage(
             "candidates_total": candidates_total,                # all candidates before cap
             "candidates_keyword_matched": keyword_match_count,   # title-keyword hits (high signal)
             "candidates_dropped_by_cap": candidates_dropped,     # how many we didn't extract
+            "candidates_dropped_titles": candidates_dropped_titles,  # up to 10 titles excluded
             "covered_count": covered_count,
             "uncovered_count": len(individual_books) - covered_count,
         },
@@ -563,7 +583,10 @@ def suggest_dedup_resolution(
             "missing": missing,
         }
 
-    # Sort by score desc — best book first
+    # Sort: quality score desc, then book id asc as the documented tie-break.
+    # Python sort is stable, so we pre-sort by id, then sort by score desc;
+    # ties keep the lowest id first (matches the reasons[]) message below).
+    valid = sorted(valid, key=lambda b: b["id"])
     ranked = sorted(valid, key=_book_quality_score, reverse=True)
     keep = ranked[0]
     delete = ranked[1:]

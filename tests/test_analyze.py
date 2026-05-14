@@ -13,6 +13,7 @@ from calibre_mcp.tools.analyze import (
     _book_quality_score,
     _is_compilation_candidate,
     _is_meaningful_toc_entry,
+    _title_matches_toc_entry,
     suggest_dedup_resolution,
 )
 
@@ -337,3 +338,159 @@ class TestSuggestDedupResolution:
         result = suggest_dedup_resolution(backend, [1, 99])
         assert result["status"] == "error"
         assert 99 in result["missing"]
+
+
+# ── Direct tests for the symmetric ratio helper (commit 73d9a36) ─────────
+
+class TestTitleMatchesTocEntry:
+    """Direct unit tests for _title_matches_toc_entry — the core matcher.
+
+    The function is hoisted from a closure, so we can exercise it without
+    spinning up a fake backend. Both directions of substring containment
+    require ratio ≥ _MIN_COVERAGE_RATIO (0.75).
+    """
+
+    def test_exact_match(self):
+        assert _title_matches_toc_entry("el chacal", "el chacal")
+
+    def test_short_title_in_long_entry_rejected(self):
+        # 9 / 18 = 0.50 < 0.75
+        assert not _title_matches_toc_entry("el chacal", "el reto del chacal")
+
+    def test_short_entry_in_long_title_rejected(self):
+        # 5 / 18 = 0.28 < 0.75 — the "Steel/parís" regression case
+        assert not _title_matches_toc_entry("una mujer en paris", "paris")
+
+    def test_near_exact_match_accepted(self):
+        # 17 / 18 ≈ 0.94 ≥ 0.75
+        assert _title_matches_toc_entry(
+            "crimen y castigo a", "crimen y castigo ab"
+        )
+
+    def test_disjoint_returns_false(self):
+        assert not _title_matches_toc_entry("uno", "dos")
+
+
+# ── TOC cache integration tests ─────────────────────────────────────────
+
+class TestTocCache:
+    """Cache invalidation must hold under the realistic failure modes."""
+
+    def test_cache_hit_when_file_unchanged(self, tmp_path):
+        from calibre_mcp.tools import _toc_cache
+
+        epub = tmp_path / "book.epub"
+        epub.write_bytes(b"PK\x03\x04" + b"x" * 5000)  # any non-empty bytes
+        _toc_cache.store(
+            str(tmp_path), book_id=1, epub_path=str(epub),
+            toc=["Cap 1", "Cap 2"], toc_source="ncx",
+            is_likely_scan=False, scan_signals=[],
+        )
+        result = _toc_cache.get_cached(str(tmp_path), 1, str(epub))
+        assert result is not None
+        assert result["toc"] == ["Cap 1", "Cap 2"]
+        assert result["_from_cache"] is True
+
+    def test_cache_invalidated_on_size_change(self, tmp_path):
+        from calibre_mcp.tools import _toc_cache
+
+        epub = tmp_path / "book.epub"
+        epub.write_bytes(b"PK\x03\x04" + b"x" * 5000)
+        _toc_cache.store(
+            str(tmp_path), book_id=1, epub_path=str(epub),
+            toc=["a"], toc_source="ncx", is_likely_scan=False, scan_signals=[],
+        )
+        # Change size — must invalidate
+        epub.write_bytes(b"PK\x03\x04" + b"x" * 9999)
+        assert _toc_cache.get_cached(str(tmp_path), 1, str(epub)) is None
+
+    def test_cache_invalidated_on_content_change_same_size(self, tmp_path):
+        """The byte-identical-resave case: same mtime, same size, different bytes.
+
+        Only catchable via content fingerprint (head + tail hash).
+        """
+        from calibre_mcp.tools import _toc_cache
+        import os
+
+        epub = tmp_path / "book.epub"
+        epub.write_bytes(b"PK\x03\x04" + b"a" * 9000)
+        _toc_cache.store(
+            str(tmp_path), book_id=1, epub_path=str(epub),
+            toc=["original"], toc_source="ncx",
+            is_likely_scan=False, scan_signals=[],
+        )
+
+        # Re-write with different content but exact same size and a forced
+        # equal mtime (mimics FAT 2-second resolution).
+        st = os.stat(str(epub))
+        epub.write_bytes(b"PK\x03\x04" + b"b" * 9000)
+        os.utime(str(epub), (st.st_atime, st.st_mtime))
+
+        assert _toc_cache.get_cached(str(tmp_path), 1, str(epub)) is None, \
+            "different content must invalidate even when mtime+size are equal"
+
+    def test_cache_lives_in_hidden_subdir(self, tmp_path):
+        """Cache file must NOT pollute the library root (visible to check_library)."""
+        from calibre_mcp.tools import _toc_cache
+
+        epub = tmp_path / "book.epub"
+        epub.write_bytes(b"PK\x03\x04xxxxxx")
+        _toc_cache.store(
+            str(tmp_path), book_id=1, epub_path=str(epub),
+            toc=["x"], toc_source="ncx", is_likely_scan=False, scan_signals=[],
+        )
+        # No cache file at root
+        assert not (tmp_path / "_calibre_mcp_toc_cache.db").exists()
+        # Subdir is created (hidden via leading dot)
+        assert (tmp_path / ".calibre_mcp_cache" / "toc.db").exists()
+
+    def test_legacy_cache_file_migrated(self, tmp_path):
+        """Old cache file at root must be silently moved to the new location."""
+        from calibre_mcp.tools import _toc_cache
+        import sqlite3
+
+        # Pre-create a cache file in the legacy location with the legacy schema
+        legacy = tmp_path / "_calibre_mcp_toc_cache.db"
+        conn = sqlite3.connect(str(legacy))
+        conn.executescript(
+            "CREATE TABLE toc_cache (book_id INTEGER PRIMARY KEY, x TEXT);"
+        )
+        conn.execute("INSERT INTO toc_cache VALUES (1, 'legacy')")
+        conn.commit()
+        conn.close()
+
+        # Trigger a connect — should rename the file
+        epub = tmp_path / "book.epub"
+        epub.write_bytes(b"PK\x03\x04xxxxxx")
+        _toc_cache.store(
+            str(tmp_path), book_id=2, epub_path=str(epub),
+            toc=["a"], toc_source="ncx", is_likely_scan=False, scan_signals=[],
+        )
+
+        assert not legacy.exists(), "legacy cache file should have been moved"
+        assert (tmp_path / ".calibre_mcp_cache" / "toc.db").exists()
+
+
+# ── suggest_dedup_resolution: tie-break stability (#6) ───────────────────
+
+class TestDedupTieBreak:
+    """When all quality axes are equal, must pick the lowest book id."""
+
+    def _backend(self, books):
+        def query_db(sql, params):
+            return [books.get(int(params[0]))] if int(params[0]) in books else []
+        return SimpleNamespace(query_db=query_db)
+
+    def test_ties_pick_lowest_id_regardless_of_input_order(self):
+        # Two identically-scored books — input order [42, 5, 17] must NOT
+        # decide; we must pick id=5.
+        common = {"format": "EPUB", "uncompressed_size": 100,
+                  "has_cover": 0, "has_comments": 0, "last_modified": ""}
+        books = {
+            42: {"id": 42, "title": "X", **common},
+            5:  {"id": 5,  "title": "X", **common},
+            17: {"id": 17, "title": "X", **common},
+        }
+        backend = self._backend(books)
+        result = suggest_dedup_resolution(backend, [42, 5, 17])
+        assert result["keep"]["id"] == 5
