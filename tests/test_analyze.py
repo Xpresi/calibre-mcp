@@ -16,6 +16,7 @@ from calibre_mcp.tools.analyze import (
     _title_matches_toc_entry,
     _title_match_kind,
     suggest_dedup_resolution,
+    regenerate_pending_worklist,
 )
 
 
@@ -105,6 +106,56 @@ class TestReadProcessedAuthors:
         assert normalize_for_grouping("Borges, Jorge Luis") in result
         assert normalize_for_grouping("Steel, Danielle") in result
         assert len(result) == 3
+
+
+class TestRegeneratePendingWorklist:
+    def test_writes_pending_authors_filtered_by_done(self, tmp_path):
+        hecho = tmp_path / "hecho.md"
+        hecho.write_text(
+            "Steel, Danielle | 2026-05-14 | 0 | done\n",
+            encoding="utf-8",
+        )
+        out = tmp_path / "pendientes.md"
+
+        # Fake backend with deterministic rows
+        class FakeBackend:
+            def query_db(self, sql, params):
+                # Return three authors above threshold; only Steel is in hecho.md
+                return [
+                    {"id": 10, "name": "Steel, Danielle", "book_count": 76},
+                    {"id": 20, "name": "Neels, Betty", "book_count": 74},
+                    {"id": 30, "name": "Gardner, Erle Stanley", "book_count": 93},
+                ]
+
+        result = regenerate_pending_worklist(
+            FakeBackend(),
+            min_books=15,
+            output_path=str(out),
+            hecho_path=str(hecho),
+        )
+        assert result["pending_count"] == 2
+        assert result["processed_count"] == 1
+        assert result["total_authors_above_threshold"] == 3
+
+        content = out.read_text(encoding="utf-8")
+        assert "- [ ] Neels, Betty (74) [id=20]" in content
+        assert "- [ ] Gardner, Erle Stanley (93) [id=30]" in content
+        # Steel is in hecho, must be excluded
+        assert "Steel, Danielle" not in content
+
+    def test_creates_parent_directory(self, tmp_path):
+        hecho = tmp_path / "hecho.md"
+        hecho.write_text("", encoding="utf-8")
+        out = tmp_path / "subdir" / "pendientes.md"
+
+        class FakeBackend:
+            def query_db(self, sql, params):
+                return [{"id": 1, "name": "X, Y", "book_count": 20}]
+
+        regenerate_pending_worklist(
+            FakeBackend(), output_path=str(out), hecho_path=str(hecho)
+        )
+        assert out.exists()
 
 
 class TestBookQualityScore:

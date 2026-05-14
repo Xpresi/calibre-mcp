@@ -151,6 +151,96 @@ def next_author_to_process(
     }
 
 
+# ── Worklist generator: persistent pending-authors queue ───────────────────
+
+_DEFAULT_PENDIENTES_PATH = Path.home() / "claude" / "calibre-pendientes.md"
+
+
+def regenerate_pending_worklist(
+    backend,
+    min_books: int = 15,
+    output_path: str | None = None,
+    hecho_path: str | None = None,
+) -> dict[str, Any]:
+    """Regenerate calibre-pendientes.md with all authors not yet processed.
+
+    Writes a markdown checklist of pending authors (>=min_books, not in
+    calibre-hecho.md), sorted by descending book count. The session then
+    reads/edits that file directly instead of calling next_author_to_process
+    repeatedly — one DB query and one progress-file parse per regeneration,
+    not per author.
+
+    Format of the output file:
+        # Autores pendientes - generado YYYY-MM-DD
+        - [ ] Steel, Danielle (76) [id=2141]
+        - [ ] McIntire, Kelltom (74) [id=...]
+
+    Mark "[x]" as you finish each author (and also add a line to
+    calibre-hecho.md as the historical log per Rule 6).
+
+    Regenerate when the list is exhausted or the library has new authors.
+
+    Args:
+        min_books: Skip authors with fewer than this many books.
+        output_path: Override path for calibre-pendientes.md.
+            Defaults to ~/claude/calibre-pendientes.md.
+        hecho_path: Override path to calibre-hecho.md.
+            Defaults to ~/claude/calibre-hecho.md.
+
+    Returns:
+        {
+          "pending_count": int,
+          "processed_count": int,
+          "total_authors_above_threshold": int,
+          "output_file": str,
+          "hecho_file": str,
+        }
+    """
+    from datetime import date
+
+    out_path = Path(output_path) if output_path else _DEFAULT_PENDIENTES_PATH
+    hecho = Path(hecho_path) if hecho_path else _DEFAULT_HECHO_PATH
+
+    processed = _read_processed_authors(hecho)
+
+    rows = backend.query_db(
+        """
+        SELECT a.id, a.name, COUNT(bal.book) AS book_count
+        FROM authors a
+        JOIN books_authors_link bal ON a.id = bal.author
+        GROUP BY a.id, a.name
+        HAVING COUNT(bal.book) >= ?
+        ORDER BY book_count DESC, a.name
+        """,
+        (int(min_books),),
+    )
+
+    pending = [r for r in rows if normalize_for_grouping(r["name"]) not in processed]
+
+    today = date.today().isoformat()
+    lines = [
+        f"# Autores pendientes - generado {today}",
+        "",
+        f"Total: {len(pending)} autores con >= {min_books} libros, no en calibre-hecho.md.",
+        "",
+        "Marca `[x]` al terminar cada uno (y registra tambien en `calibre-hecho.md`).",
+        "",
+    ]
+    for r in pending:
+        lines.append(f"- [ ] {r['name']} ({r['book_count']}) [id={r['id']}]")
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    return {
+        "pending_count": len(pending),
+        "processed_count": len(processed),
+        "total_authors_above_threshold": len(rows),
+        "output_file": str(out_path),
+        "hecho_file": str(hecho),
+    }
+
+
 # ── Title normalization shared by #2 and #3 ────────────────────────────────
 
 

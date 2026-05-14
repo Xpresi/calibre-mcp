@@ -742,7 +742,9 @@ TOOLS = [
             "Return the next N authors that haven't been logged in calibre-hecho.md yet, "
             "sorted by descending book count. Use this at the start of a cleanup session "
             "instead of guessing which author to process. Skips authors already recorded "
-            "in the progress file (matched by normalized name)."
+            "in the progress file (matched by normalized name). "
+            "PREFERRED ALTERNATIVE: regenerate_pending_worklist + read calibre-pendientes.md "
+            "(one query for the whole session, persistent state, easier to skip authors)."
         ),
         inputSchema={
             "type": "object",
@@ -751,6 +753,27 @@ TOOLS = [
                               "description": "Skip authors with fewer than this many books."},
                 "limit": {"type": "integer", "default": 5,
                           "description": "Number of candidates to return."},
+                "hecho_path": {"type": "string",
+                               "description": "Override path to calibre-hecho.md (defaults to ~/claude/calibre-hecho.md)."},
+            },
+        },
+    ),
+    Tool(
+        name="regenerate_pending_worklist",
+        description=(
+            "Generate calibre-pendientes.md as a persistent markdown checklist of all authors "
+            "with >= min_books that aren't yet logged in calibre-hecho.md. "
+            "The session reads/edits that file directly per author (read first '- [ ]', "
+            "process, mark '- [x]') instead of calling next_author_to_process repeatedly. "
+            "Run this once per cleanup session (or when the list is exhausted)."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "min_books": {"type": "integer", "default": 15,
+                              "description": "Skip authors with fewer than this many books."},
+                "output_path": {"type": "string",
+                                "description": "Where to write the worklist (defaults to ~/claude/calibre-pendientes.md)."},
                 "hecho_path": {"type": "string",
                                "description": "Override path to calibre-hecho.md (defaults to ~/claude/calibre-hecho.md)."},
             },
@@ -963,6 +986,9 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
             # Workflow
             case "next_author_to_process":
                 return _json_response(analyze.next_author_to_process(backend, **arguments))
+
+            case "regenerate_pending_worklist":
+                return _json_response(analyze.regenerate_pending_worklist(backend, **arguments))
             case "find_compilation_coverage":
                 return _json_response(analyze.find_compilation_coverage(backend, **arguments))
             case "suggest_dedup_resolution":
