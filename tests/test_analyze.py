@@ -61,6 +61,49 @@ class TestReadProcessedAuthors:
         f.write_text("# heading\n\n---\nReal Author | 2026 | 1 | x\n", encoding="utf-8")
         assert len(_read_processed_authors(f)) == 1
 
+    def test_parses_markdown_table_rows(self, tmp_path):
+        """Lots 5 and 6 of the real hecho.md use markdown table format."""
+        from calibre_mcp.utils.normalize import normalize_for_grouping
+        f = tmp_path / "hecho.md"
+        f.write_text(
+            "| Autor | Libros | Borrados | Nota |\n"
+            "|---|---|---|---|\n"
+            "| Steel, Danielle | 76 | 0 | 4 falsos positivos |\n"
+            "| Neels, Betty | 74 | 0 | Limpio |\n"
+            "| Gardner, Erle Stanley | 93 | 0 | Perry Mason |\n",
+            encoding="utf-8",
+        )
+        result = _read_processed_authors(f)
+        assert normalize_for_grouping("Steel, Danielle") in result
+        assert normalize_for_grouping("Neels, Betty") in result
+        assert normalize_for_grouping("Gardner, Erle Stanley") in result
+        # Header row "Autor" must NOT be treated as an author name
+        assert normalize_for_grouping("Autor") not in result
+        # Separator row "|---|---|---|---|" must NOT be parsed
+        assert len(result) == 3
+
+    def test_mixed_canonical_and_table_formats(self, tmp_path):
+        """A real hecho.md mixes both formats — both must be picked up."""
+        from calibre_mcp.utils.normalize import normalize_for_grouping
+        f = tmp_path / "hecho.md"
+        f.write_text(
+            "# Calibre — Autores ya procesados\n"
+            "Formato: `Autor | Fecha | Borrados | Nota`\n"
+            "---\n"
+            "Cervantes, Miguel de | anterior | 20 | note\n"
+            "Borges, Jorge Luis | anterior | 0 | clean\n"
+            "\n"
+            "| Autor | Libros | Borrados | Nota |\n"
+            "|---|---|---|---|\n"
+            "| Steel, Danielle | 76 | 0 | falsos positivos |\n",
+            encoding="utf-8",
+        )
+        result = _read_processed_authors(f)
+        assert normalize_for_grouping("Cervantes, Miguel de") in result
+        assert normalize_for_grouping("Borges, Jorge Luis") in result
+        assert normalize_for_grouping("Steel, Danielle") in result
+        assert len(result) == 3
+
 
 class TestBookQualityScore:
     def test_epub_beats_fb2(self):
@@ -223,6 +266,36 @@ class TestCoverageMatcher:
         compilation = next(c for c in result["compilations"] if c["book_id"] == 1)
         assert 2 in compilation["covered_book_ids"], (
             "exact-title match must still work"
+        )
+
+    def test_short_toc_entry_does_not_match_long_title(self):
+        """The 'Steel' regression: short TOC entry as substring of long title.
+
+        Pre-fix: a 5-char TOC entry like 'paris' would match the 18-char title
+        'una mujer en parís' because the asymmetric ratio check only kicked in
+        when the TITLE was the substring, not when the TOC entry was.
+
+        Post-fix: ratio applies in both directions, so 5/18 = 0.28 < 0.75 → no match.
+        """
+        from calibre_mcp.tools import epub as epub_tools
+        from calibre_mcp.tools.analyze import find_compilation_coverage
+
+        books = [
+            {"id": 1, "title": "Antología", "format": "EPUB", "uncompressed_size": 5_000_000},
+            {"id": 2, "title": "Una mujer en París", "format": "EPUB", "uncompressed_size": 80_000},
+        ]
+        # A TOC of an unrelated anthology that happens to mention "paris"
+        toc_for = {1: ["paris", "casa", "hotel"]}
+        backend, original = self._make_backend(books, toc_for)
+        try:
+            result = find_compilation_coverage(backend, author_id=1)
+        finally:
+            epub_tools.get_epub_toc = original
+
+        compilation = next(c for c in result["compilations"] if c["book_id"] == 1)
+        assert 2 not in compilation["covered_book_ids"], (
+            f"short TOC entry wrongly matched long title "
+            f"(coverage={compilation['covered_book_ids']})"
         )
 
 

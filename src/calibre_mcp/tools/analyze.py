@@ -30,14 +30,29 @@ logger = logging.getLogger("calibre_mcp")
 _DEFAULT_HECHO_PATH = Path.home() / "claude" / "calibre-hecho.md"
 
 # Recognises the leading author field in lines like:
-#   "Author Name | 2026-05-10 | 5 | note..."
+#   "Author Name | 2026-05-10 | 5 | note..."     (canonical, no leading pipe)
 #   "Author Name | anterior | 27 FB2 | ..."
-# Comment/blank/header lines are skipped.
-_HECHO_LINE_RE = re.compile(r"^\s*([^|#\-][^|]*?)\s*\|")
+#   "| Author Name | 5 | 0 | note |"             (markdown table row)
+# Comment / blank / table-separator / table-header lines are skipped.
+_HECHO_LINE_RE = re.compile(r"^\s*\|?\s*([^|#\-][^|]*?)\s*\|")
+
+# Recognised header rows in a markdown table — first cell is one of these.
+# Header rows aren't author names; without this filter "Autor" itself would
+# end up in the processed set (harmless but confusing).
+_HECHO_TABLE_HEADERS = {
+    "autor", "author", "name", "nombre",
+}
 
 
 def _read_processed_authors(path: Path) -> set[str]:
     """Return the set of normalized author names already logged in calibre-hecho.md.
+
+    Recognises two formats in the same file:
+      - "Author | date | books | note"            (canonical, no leading pipe)
+      - "| Author | books | borrados | note |"    (markdown table row)
+
+    Skips: comments (#…), separators (---…|---|), Formato: line, blank lines,
+    and table header rows whose first cell is "Autor"/"Author"/"Nombre"/"Name".
 
     Returns an empty set if the file doesn't exist (so a fresh user gets
     the full author list on first call). Non-fatal on any read error.
@@ -51,9 +66,17 @@ def _read_processed_authors(path: Path) -> set[str]:
                 stripped = line.lstrip()
                 if not stripped or stripped.startswith(("#", "-", "Formato")):
                     continue
+                # Markdown table separator like "|---|---|---|" — leading `|`
+                # then `-`. Our regex would still skip these because [^|#\-]
+                # blocks `-`, but explicit guard makes intent obvious.
+                if stripped.startswith("|") and "---" in stripped:
+                    continue
                 m = _HECHO_LINE_RE.match(line)
                 if m:
-                    processed.add(normalize_for_grouping(m.group(1)))
+                    candidate = m.group(1).strip()
+                    if candidate.lower() in _HECHO_TABLE_HEADERS:
+                        continue  # skip "| Autor | Libros | ... |" header rows
+                    processed.add(normalize_for_grouping(candidate))
     except OSError as exc:
         logger.warning(f"Could not read {path}: {exc}")
     return processed
@@ -348,19 +371,25 @@ def find_compilation_coverage(
             if not tnorm or len(tnorm) < _MIN_MATCH_LEN:
                 continue
             # A book is "covered" if any meaningful TOC entry matches its title.
+            # Both directions of substring containment require the same coverage
+            # ratio (≥ 75 %) — symmetry matters because asymmetric checks let
+            # short common TOC entries match arbitrary long titles:
             #
-            # Two match modes:
-            #   (a) title ⊆ TOC entry: valid only if the title covers ≥ 75% of the
-            #       entry's length (prevents "el chacal" matching "el reto del chacal").
-            #       Short titles can still match if the TOC entry is equally short
-            #       (exact or near-exact match).
-            #   (b) TOC entry ⊆ title: the entry must be ≥ MIN_MATCH_LEN chars so
-            #       that single words don't trigger a match.
+            #   tnorm = "una mujer en parís"   (18 chars)
+            #   entry = "parís"                ( 5 chars)   → entry in tnorm
+            #
+            # Without the ratio on this direction, every Steel novel mentioning
+            # "París" would be marked as covered by an unrelated TOC.
+            #
+            # Cases now allowed:
+            #   (a) title ⊆ TOC entry:  len(title) / len(entry) ≥ 0.75
+            #   (b) TOC entry ⊆ title:  len(entry) / len(title) ≥ 0.75
+            # Exact matches (ratio = 1.0) keep working in both directions.
             def _matches(entry: str) -> bool:
                 if tnorm in entry:
                     return len(tnorm) / len(entry) >= _MIN_COVERAGE_RATIO
                 if entry in tnorm and len(entry) >= _MIN_MATCH_LEN:
-                    return True
+                    return len(entry) / len(tnorm) >= _MIN_COVERAGE_RATIO
                 return False
 
             if any(_matches(entry) for entry in toc_norm):
