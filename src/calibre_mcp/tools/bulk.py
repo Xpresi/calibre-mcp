@@ -1010,13 +1010,15 @@ def find_orphaned_metadata(
         dry_run: If True (default), only list orphans. If False, delete them.
     """
     found: dict[str, list[str]] = {}
-    for table, link_col, link_table in METADATA_TABLES:
+    for table, link_col, link_table, display_col in METADATA_TABLES:
+        # display_col varies per table — 'name' for authors/series/tags/publishers,
+        # 'lang_code' for languages (the languages table has no name column).
         rows = backend.query_db(
-            f"SELECT name FROM {table} "
+            f"SELECT {display_col} AS display FROM {table} "
             f"WHERE id NOT IN (SELECT {link_col} FROM {link_table}) "
-            f"ORDER BY name"
+            f"ORDER BY {display_col}"
         )
-        names = [r["name"] for r in rows]
+        names = [r["display"] for r in rows]
         if names:
             found[table] = names
 
@@ -1039,7 +1041,7 @@ def find_orphaned_metadata(
     try:
         conn = backend.connect_write(timeout=10)
         deleted: dict[str, int] = {}
-        for table, link_col, link_table in METADATA_TABLES:
+        for table, link_col, link_table, _display in METADATA_TABLES:
             if table in found:
                 cursor = conn.execute(
                     f"DELETE FROM {table} "

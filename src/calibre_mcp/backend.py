@@ -83,16 +83,19 @@ BOOK_CHILD_TABLES: list[tuple[str, str]] = [
     ("conversion_options",     "book"),  # Per-book conversion settings
 ]
 
-# (entity_table, link_col_in_link_table, link_table) — the metadata entity
-# tables that can become orphan when no books reference them. languages MUST
-# be included: a stale 'eng' row triggers FK violations in the Calibre GUI
-# when it tries its own cleanup pass after a deletion.
-METADATA_TABLES: list[tuple[str, str, str]] = [
-    ("authors",    "author",    "books_authors_link"),
-    ("series",     "series",    "books_series_link"),
-    ("tags",       "tag",       "books_tags_link"),
-    ("publishers", "publisher", "books_publishers_link"),
-    ("languages",  "lang_code", "books_languages_link"),
+# (entity_table, link_col_in_link_table, link_table, display_column) —
+# the metadata entity tables that can become orphan when no books reference
+# them. languages MUST be included: a stale 'eng' row triggers FK violations
+# in the Calibre GUI when it tries its own cleanup pass after a deletion.
+# display_column is the column to SELECT when listing orphans for humans:
+# 'name' for authors/series/tags/publishers, 'lang_code' for languages
+# (which has no `name` column).
+METADATA_TABLES: list[tuple[str, str, str, str]] = [
+    ("authors",    "author",    "books_authors_link",    "name"),
+    ("series",     "series",    "books_series_link",     "name"),
+    ("tags",       "tag",       "books_tags_link",       "name"),
+    ("publishers", "publisher", "books_publishers_link", "name"),
+    ("languages",  "lang_code", "books_languages_link",  "lang_code"),
 ]
 
 

@@ -357,7 +357,7 @@ def _cleanup_orphans(conn: "sqlite3.Connection") -> dict:
     in Calibre GUI when the GUI tries to clean up a language after deleting a book.
     """
     cleaned: dict[str, int] = {}
-    for table, link_col, link_table in METADATA_TABLES:
+    for table, link_col, link_table, _display in METADATA_TABLES:
         cursor = conn.execute(
             f"DELETE FROM {table} WHERE id NOT IN (SELECT {link_col} FROM {link_table})"
         )

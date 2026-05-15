@@ -176,3 +176,60 @@ def test_bulk_set_metadata_runs_single_global_cleanup(db_with_book):
     assert result["status"] == "completed"
     assert "orphans_cleaned" in result, "bulk should report a cleanup pass"
     assert _orphans(db_with_book, "series", "books_series_link", "series") == []
+
+
+# ── Regression: find_orphaned_metadata must not crash on the languages table ──
+
+
+def test_find_orphaned_metadata_handles_languages_table(db_with_book):
+    """The languages table uses lang_code as display, not name.
+
+    A unified METADATA_TABLES list that hard-codes SELECT name FROM ... breaks
+    here. This regressed in commit 2303f59 (METADATA_TABLES dedup) and shipped
+    until detected in a manual orphan check post-cleanup. The fix added a
+    display_column to the tuple so the SQL can vary per table.
+    """
+    from calibre_mcp.tools.bulk import find_orphaned_metadata
+
+    backend = _make_backend(db_with_book)
+    # Make the existing 'eng' row orphan so we have something to find in
+    # the languages table specifically.
+    conn = sqlite3.connect(str(db_with_book))
+    conn.execute("INSERT INTO languages (id, lang_code) VALUES (99, 'fra')")
+    conn.commit()
+    conn.close()
+
+    # Must not raise — used to fail with "no such column: name" for languages.
+    result = find_orphaned_metadata(backend, dry_run=True)
+    assert result["status"] == "dry_run"
+
+    # 'fra' has no books, so it must show up under languages.
+    assert "languages" in result["orphans"]
+    assert "fra" in result["orphans"]["languages"]
+
+
+def test_find_orphaned_metadata_iterates_all_five_tables(db_with_book):
+    """All five metadata tables (authors, series, tags, publishers, languages)
+    must be iterated. The query for each must not crash regardless of its
+    display column."""
+    from calibre_mcp.tools.bulk import find_orphaned_metadata
+
+    backend = _make_backend(db_with_book)
+    # Create an orphan in every metadata table so each is exercised
+    conn = sqlite3.connect(str(db_with_book))
+    conn.execute("INSERT INTO authors    (id, name) VALUES (901, 'Orphan Author')")
+    conn.execute("INSERT INTO series     (id, name) VALUES (902, 'Orphan Series')")
+    conn.execute("INSERT INTO tags       (id, name) VALUES (903, 'OrphanTag')")
+    conn.execute("INSERT INTO publishers (id, name) VALUES (904, 'OrphanPub')")
+    conn.execute("INSERT INTO languages  (id, lang_code) VALUES (905, 'xyz')")
+    conn.commit()
+    conn.close()
+
+    result = find_orphaned_metadata(backend, dry_run=True)
+    assert result["status"] == "dry_run"
+    # All five tables must be present
+    assert "Orphan Author" in result["orphans"].get("authors", [])
+    assert "Orphan Series" in result["orphans"].get("series", [])
+    assert "OrphanTag"     in result["orphans"].get("tags", [])
+    assert "OrphanPub"     in result["orphans"].get("publishers", [])
+    assert "xyz"           in result["orphans"].get("languages", [])
