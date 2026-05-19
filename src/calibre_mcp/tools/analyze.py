@@ -24,10 +24,10 @@ logger = logging.getLogger("calibre_mcp")
 
 
 # ── #4: progress tracker — read calibre-hecho.md to skip done authors ──────
-
-# Default path to the per-user progress log. The user can override via
-# config.calibre_hecho_path if they relocate it.
-_DEFAULT_HECHO_PATH = Path.home() / "claude" / "calibre-hecho.md"
+#
+# Defaults: both the progress log (calibre-hecho.md) and the pending worklist
+# (calibre-pendientes.md) live next to the library by default. Callers can
+# override via the hecho_path / output_path arguments to relocate them.
 
 # Recognises the leading author field in lines like:
 #   "Author Name | 2026-05-10 | 5 | note..."     (canonical, no leading pipe)
@@ -83,6 +83,10 @@ def _read_processed_authors(path: Path) -> set[str]:
                     candidate = m.group(1).replace(_ESCAPED_PIPE_SENTINEL, "|").strip()
                     if candidate.lower() in _HECHO_TABLE_HEADERS:
                         continue  # skip "| Autor | Libros | ... |" header rows
+                    # Strip trailing "(N) [id=N]" suffix present in some log formats
+                    candidate = re.sub(r'\s*\(\d+\)\s*\[id=\d+\]$', '', candidate).strip()
+                    # Normalize apostrophe variants so O'Brian matches O'Brian
+                    candidate = candidate.replace('’', "'").replace('‘', "'")
                     processed.add(normalize_for_grouping(candidate))
     except OSError as exc:
         logger.warning(f"Could not read {path}: {exc}")
@@ -106,7 +110,7 @@ def next_author_to_process(
         limit: How many candidates to return (default 5 — enough to choose from
             without flooding the response).
         hecho_path: Override path to calibre-hecho.md. Defaults to
-            ~/claude/calibre-hecho.md.
+            <library_path>/calibre-hecho.md.
 
     Returns:
         {
@@ -116,7 +120,7 @@ def next_author_to_process(
           "hecho_exists": bool,
         }
     """
-    path = Path(hecho_path) if hecho_path else _DEFAULT_HECHO_PATH
+    path = Path(hecho_path) if hecho_path else Path(backend.config.library_path) / "calibre-hecho.md"
     processed = _read_processed_authors(path)
 
     rows = backend.query_db(
@@ -153,8 +157,6 @@ def next_author_to_process(
 
 # ── Worklist generator: persistent pending-authors queue ───────────────────
 
-_DEFAULT_PENDIENTES_PATH = Path.home() / "claude" / "calibre-pendientes.md"
-
 
 def regenerate_pending_worklist(
     backend,
@@ -183,9 +185,9 @@ def regenerate_pending_worklist(
     Args:
         min_books: Skip authors with fewer than this many books.
         output_path: Override path for calibre-pendientes.md.
-            Defaults to ~/claude/calibre-pendientes.md.
+            Defaults to <library_path>/calibre-pendientes.md.
         hecho_path: Override path to calibre-hecho.md.
-            Defaults to ~/claude/calibre-hecho.md.
+            Defaults to <library_path>/calibre-hecho.md.
 
     Returns:
         {
@@ -198,8 +200,9 @@ def regenerate_pending_worklist(
     """
     from datetime import date
 
-    out_path = Path(output_path) if output_path else _DEFAULT_PENDIENTES_PATH
-    hecho = Path(hecho_path) if hecho_path else _DEFAULT_HECHO_PATH
+    library = Path(backend.config.library_path)
+    out_path = Path(output_path) if output_path else library / "calibre-pendientes.md"
+    hecho = Path(hecho_path) if hecho_path else library / "calibre-hecho.md"
 
     processed = _read_processed_authors(hecho)
 

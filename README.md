@@ -1,6 +1,6 @@
 # Calibre MCP Server
 
-MCP (Model Context Protocol) server for managing a Calibre ebook library. Provides 30+ tools for querying, diagnosing, and cleaning up your library — including duplicate detection, author normalization, series ordering, and metadata completion.
+MCP (Model Context Protocol) server for managing a Calibre ebook library. Provides 40+ tools for querying, diagnosing, and cleaning up your library — including duplicate detection, author normalization, series ordering, metadata completion, and high-level workflow helpers.
 
 ---
 
@@ -35,7 +35,7 @@ The `remove_books` tool **deletes book files from disk**. There is no recycle bi
 ## Installation
 
 ```bash
-git clone https://github.com/yourname/calibre-mcp
+git clone https://github.com/Xpresi/calibre-mcp
 cd calibre-mcp
 
 # With pip
@@ -112,6 +112,7 @@ Or with uv:
 
 | Tool | Description |
 |------|-------------|
+| `get_server_info` | Server start time, git commit, library path |
 | `library_stats` | Summary counts: books, authors, series, formats, languages |
 | `search_books` | Search by title, author, series, tag, or format |
 | `get_book_details` | Full metadata for a single book |
@@ -120,6 +121,7 @@ Or with uv:
 | `list_series` | Pageable list of all series |
 | `list_tags` | All tags with book counts |
 | `list_publishers` | All publishers with book counts |
+| `get_epub_toc` | Extract TOC from an EPUB and flag likely scan-EPUBs |
 
 ### Diagnosis — read-only
 
@@ -133,6 +135,9 @@ Or with uv:
 | `find_orphan_links` | Broken foreign-key references in link tables |
 | `find_orphan_files` | Directories on disk with no matching DB record |
 | `find_ghost_books` | DB records pointing to non-existent directories |
+| `find_orphaned_metadata` | Authors/series/tags/publishers with no books |
+| `verify_file_integrity` | Confirm every DB-referenced file exists on disk (case-aware) |
+| `check_library` | Run Calibre's native integrity checker |
 
 ### ⚠️ Write — modifies your library
 
@@ -161,7 +166,20 @@ Or with uv:
 | `generate_report` | Full markdown health report of the library |
 | `compare_snapshots` | Diff between two library states |
 | `export_catalog` | Export library catalog as CSV, XML, EPUB, or MOBI |
+| `fts_index` | Enable, disable, or reindex full-text search |
 | `fts_search` | Full-text search inside book contents |
+
+### Workflow — high-level helpers
+
+Compose lower-level tools into one-shot answers, useful when iterating on author cleanup.
+
+| Tool | Description |
+|------|-------------|
+| `analyze_author` | Mega-analysis for a single author: compilation coverage, duplicates, similar-named authors, series gaps, metadata gaps, prioritised actions |
+| `find_compilation_coverage` | Detect which individual books are covered by which omnibus/compilation EPUBs (uses TOC cache) |
+| `suggest_dedup_resolution` | Given a group of duplicates, propose which copy to keep (format > cover > comments > size > recency) |
+| `next_author_to_process` | Return the next N authors not yet logged in `calibre-hecho.md` |
+| `regenerate_pending_worklist` | Write `calibre-pendientes.md` checklist of pending authors (read/edit per session, mark `[x]` as you go) |
 
 ---
 

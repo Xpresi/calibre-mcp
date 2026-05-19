@@ -119,6 +119,7 @@ class TestRegeneratePendingWorklist:
 
         # Fake backend with deterministic rows
         class FakeBackend:
+            config = SimpleNamespace(library_path=str(tmp_path))
             def query_db(self, sql, params):
                 # Return three authors above threshold; only Steel is in hecho.md
                 return [
@@ -149,6 +150,7 @@ class TestRegeneratePendingWorklist:
         out = tmp_path / "subdir" / "pendientes.md"
 
         class FakeBackend:
+            config = SimpleNamespace(library_path=str(tmp_path))
             def query_db(self, sql, params):
                 return [{"id": 1, "name": "X, Y", "book_count": 20}]
 

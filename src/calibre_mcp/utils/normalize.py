@@ -11,8 +11,9 @@ def normalize_for_grouping(name: str) -> str:
     'Stephen King' and 'King, Stephen' produce the same key.
     """
     s = name.lower().strip()
-    # Strip apostrophes without inserting a space (O'Brien → OBrien, not O Brien)
-    s = re.sub(r"'", '', s)
+    # Strip apostrophes (straight ' and curly ' ') without inserting a space
+    # so O'Brian and O’Brian both normalize to OBrian
+    s = re.sub(r"['‘’ʼ]", '', s)
     # Remove quotes, brackets, parens
     s = re.sub(r'[«»"\(\)\[\]]+', ' ', s)
     # Decompose unicode and strip combining marks (accents)
