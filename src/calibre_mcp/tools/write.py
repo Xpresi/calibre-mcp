@@ -275,9 +275,10 @@ def _set_metadata_sqlite(backend, book_id: int, fields: dict, cleanup_orphans: b
             conn.close()
 
 
-def _remove_books_sqlite(backend, books: list[dict]) -> list[dict]:
+def _remove_books_sqlite(backend, books: list[dict]) -> tuple[list[dict], dict]:
     """
     Remove books directly via SQLite + filesystem.
+    Returns (removed_books, orphan_cleanup_result).
     Faster than calibredb remove for large libraries.
     Sends book directory to the OS Recycle Bin (send2trash); falls back to
     permanent deletion only if send2trash is not installed.
@@ -428,7 +429,8 @@ def set_book_metadata(
     dry_run: bool = True,
 ) -> dict[str, Any]:
     """
-    Set metadata fields on a book using calibredb set_metadata.
+    Set metadata fields on a book via direct SQLite writes (fast — avoids the
+    calibredb full-library scan that times out on large libraries).
 
     Args:
         book_id: ID of the book to modify

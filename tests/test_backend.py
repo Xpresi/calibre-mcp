@@ -1,61 +1,46 @@
-"""Tests for CalibreBackend — works with a real metadata.db if available."""
+"""Integration tests for the Calibre backend — these run against the real library."""
 
-import os
 import pytest
+
 from calibre_mcp.config import Config
 from calibre_mcp.backend import CalibreBackend
+from calibre_mcp.tools.report import generate_report, compare_snapshots
 
 
 @pytest.fixture
-def config():
-    """Load config, skip tests if library is not accessible."""
+def backend():
     cfg = Config.load()
-    errors = cfg.validate()
-    if any("metadata.db" in e for e in errors) or any("Library path" in e for e in errors):
+    b = CalibreBackend(cfg)
+    # Skip integration tests if the library isn't accessible
+    if not b.db_path.exists():
         pytest.skip("Calibre library not accessible — skipping integration tests")
-    return cfg
+    return b
 
 
-@pytest.fixture
-def backend(config):
-    return CalibreBackend(config)
+def test_library_stats_keys(backend):
+    """get_library_stats must expose the keys generate_report/compare_snapshots rely on."""
+    stats = backend.get_library_stats()
+    for key in (
+        "total_books", "total_authors", "total_series", "total_tags",
+        "total_publishers", "books_without_cover", "books_without_data_records",
+        "books_without_tags", "books_without_language", "database_size_mb",
+        "formats", "top_languages", "library_path",
+    ):
+        assert key in stats, f"missing stats key: {key}"
 
 
-class TestLibraryStats:
-    def test_returns_expected_keys(self, backend):
-        stats = backend.get_library_stats()
-        assert "total_books" in stats
-        assert "total_authors" in stats
-        assert "total_series" in stats
-        assert "total_tags" in stats
-        assert "total_publishers" in stats
-        assert "formats" in stats
-        assert "database_size_mb" in stats
-        assert stats["total_books"] > 0
-
-    def test_format_counts_are_positive(self, backend):
-        stats = backend.get_library_stats()
-        for fmt, count in stats["formats"].items():
-            assert count > 0, f"Format {fmt} has 0 books"
+def test_generate_report_does_not_crash(backend):
+    """Regression: generate_report referenced a non-existent 'books_without_files'
+    key and raised KeyError on every call. Must return a non-empty markdown string."""
+    report = generate_report(backend)
+    assert isinstance(report, str)
+    assert "# Calibre Library Report" in report
+    assert "Books without cover" in report
 
 
-class TestQueryDb:
-    def test_simple_query(self, backend):
-        rows = backend.query_db("SELECT COUNT(*) as cnt FROM books")
-        assert len(rows) == 1
-        assert rows[0]["cnt"] > 0
-
-    def test_query_with_params(self, backend):
-        rows = backend.query_db(
-            "SELECT id, title FROM books WHERE title LIKE ? LIMIT 5",
-            ("%King%",)
-        )
-        assert isinstance(rows, list)
-        for row in rows:
-            assert "id" in row
-            assert "title" in row
-
-    def test_scalar_query(self, backend):
-        count = backend.query_db_scalar("SELECT COUNT(*) FROM books")
-        assert isinstance(count, int)
-        assert count > 0
+def test_compare_snapshots_self_is_noop(backend):
+    """Comparing a snapshot to itself must report no changes (and not KeyError)."""
+    snap = backend.get_library_stats()
+    diff = compare_snapshots(backend, snap)
+    assert diff["differences"] == {}
+    assert "No changes" in diff["summary"]

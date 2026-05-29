@@ -412,7 +412,7 @@ TOOLS = [
     # ── Write operations ───────────────────────────────────────────────
     Tool(
         name="remove_books",
-        description="Remove books from the library by IDs (deletes files from disk). Dry-run by default.",
+        description="Remove books from the library by IDs. Deletes DB records and sends the book directory to the OS Recycle Bin/Trash (send2trash); recoverable until the bin is emptied. Dry-run by default.",
         inputSchema={
             "type": "object",
             "properties": {
@@ -592,7 +592,7 @@ TOOLS = [
     ),
     Tool(
         name="merge_authors",
-        description="Merge author variants into a canonical author. Re-links all books via calibredb. Dry-run by default.",
+        description="Merge author variants into a canonical author. Re-links all books via direct SQLite (calibredb times out on large libraries). Dry-run by default.",
         inputSchema={
             "type": "object",
             "properties": {

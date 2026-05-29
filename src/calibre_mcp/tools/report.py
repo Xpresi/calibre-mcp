@@ -224,7 +224,7 @@ Generated: {now}
 
 ### Missing Metadata
 - Books without cover: {stats['books_without_cover']:,}
-- Books without files: {stats['books_without_files']:,}
+- Books without file records (SQL-only, run find_ghost_books for disk check): {stats['books_without_data_records']:,}
 - Books without tags: {stats['books_without_tags']:,}
 - Books without language: {stats['books_without_language']:,}
 - Books without publisher: {missing['counts'].get('no_publisher', 'N/A')}
@@ -296,7 +296,7 @@ def compare_snapshots(
     diff = {}
     compare_keys = [
         "total_books", "total_authors", "total_series", "total_tags",
-        "total_publishers", "books_without_cover", "books_without_files",
+        "total_publishers", "books_without_cover", "books_without_data_records",
         "books_without_tags", "books_without_language",
     ]
 

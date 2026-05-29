@@ -4,13 +4,14 @@ MCP (Model Context Protocol) server for managing a Calibre ebook library. Provid
 
 ---
 
-## ⚠️ WARNING: This server can permanently delete files
+## ⚠️ WARNING: This server can delete files
 
-The `remove_books` tool **deletes book files from disk**. There is no recycle bin, no undo.
+The `remove_books` tool **deletes book files from disk**.
 
+- Deleted book directories are sent to the OS **Recycle Bin / Trash** via [`send2trash`](https://pypi.org/project/Send2Trash/) (a required dependency), so an accidental deletion is recoverable until you empty the bin. If `send2trash` is somehow unavailable, the tool falls back to **permanent** deletion and logs a warning.
 - All destructive tools default to `dry_run=true` — they show what *would* happen without doing anything
 - You must explicitly pass `dry_run=false` to apply changes
-- **Back up your library before using any write operation on a large dataset**
+- **Back up your library before using any write operation on a large dataset** — the Recycle Bin is a safety net, not a backup
 - The server verifies Calibre is closed before any direct database write — but it cannot protect you from confirming a deletion you did not intend
 
 **If you are not sure what a tool does, run it with `dry_run=true` first. Always.**
@@ -187,7 +188,7 @@ Compose lower-level tools into one-shot answers, useful when iterating on author
 
 - **Dry-run by default**: every destructive tool returns a preview unless `dry_run=false` is explicitly set
 - **Calibre-closed check**: direct SQLite write operations verify the Calibre GUI is not running before touching the database
-- **`remove_books` deletes physical files**: this is intentional — it calls `calibredb remove` which removes both the DB record and the files on disk. There is no soft-delete or trash. Use `dry_run=true` to preview exactly which files will be removed before confirming.
+- **`remove_books` deletes physical files**: it removes the book's DB records (via direct SQLite) and sends the book directory to the OS Recycle Bin / Trash through `send2trash`. Deletions are therefore recoverable until the bin is emptied; if `send2trash` is unavailable it falls back to permanent removal. Use `dry_run=true` to preview exactly which files will be removed before confirming.
 - **`backup_database` only backs up `metadata.db`**, not the physical book files. For full library backups, copy the entire library folder manually.
 
 ## Running tests
