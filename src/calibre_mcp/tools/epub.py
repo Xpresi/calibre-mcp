@@ -49,8 +49,12 @@ def _extract_toc_entries(epub_path: str) -> tuple[list[str], str]:
             ncx_files = [n for n in names if n.lower().endswith("toc.ncx")]
             if ncx_files:
                 content = z.read(ncx_files[0]).decode("utf-8", errors="ignore")
-                # navLabel/text pairs — the order matters in toc.ncx, just grab <text>
-                titles = re.findall(r"<text[^>]*>(.*?)</text>", content, re.DOTALL | re.IGNORECASE)
+                # Restrict to the <navMap> block: an unscoped <text> findall also
+                # captures docTitle/docAuthor, injecting the book's own title and
+                # author as fake TOC entries (false EXACT coverage matches downstream).
+                navmap = re.search(r"<navMap.*?</navMap>", content, re.DOTALL | re.IGNORECASE)
+                scope = navmap.group(0) if navmap else content
+                titles = re.findall(r"<text[^>]*>(.*?)</text>", scope, re.DOTALL | re.IGNORECASE)
                 return _clean_titles(titles), "ncx"
 
             # Fall back to EPUB 3 nav document

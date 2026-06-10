@@ -28,3 +28,6 @@ metadata_backup_*.db
 # Internal development notes
 docs/superpowers/
 graphify-out/
+
+# Serena (semantic code navigation) local project config
+.serena/

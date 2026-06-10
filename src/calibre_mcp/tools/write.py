@@ -280,8 +280,18 @@ def _remove_books_sqlite(backend, books: list[dict]) -> tuple[list[dict], dict]:
     Remove books directly via SQLite + filesystem.
     Returns (removed_books, orphan_cleanup_result).
     Faster than calibredb remove for large libraries.
-    Sends book directory to the OS Recycle Bin (send2trash); falls back to
-    permanent deletion only if send2trash is not installed.
+
+    Order matters: ALL database rows are deleted and COMMITTED before any
+    file is touched. If a file removal then fails, the failure mode is an
+    orphan directory on disk (harmless — contents intact, detected by
+    find_orphan_files), never a ghost book. The previous interleaving
+    (trash inside the transaction loop) meant a mid-loop failure rolled the
+    DB back while earlier books' directories were already in the Recycle
+    Bin — DB rows pointing at deleted files.
+
+    Sends book directories to the OS Recycle Bin (send2trash); falls back to
+    permanent deletion only if send2trash is not installed. Per-book file
+    removal failures are reported via "file_removal_error" on the entry.
     """
     import shutil
 
@@ -293,50 +303,51 @@ def _remove_books_sqlite(backend, books: list[dict]) -> tuple[list[dict], dict]:
         logger.warning("send2trash not installed — deleted files will NOT go to Recycle Bin")
 
     library_path = Path(backend.config.library_path)
-    conn = None  # must be initialised before try so except/finally can reference it safely
-    removed = []
 
+    # Phase 1: delete all DB rows in one transaction. No filesystem side
+    # effects yet, so a failure here rolls back cleanly with nothing lost.
+    conn = backend.connect_write(timeout=15)
     try:
-        conn = backend.connect_write(timeout=15)
         conn.execute("BEGIN")
-
         for book in books:
             book_id = book["id"]
-
             # Delete from every per-book child table (see backend.BOOK_CHILD_TABLES).
             for table, col in BOOK_CHILD_TABLES:
                 conn.execute(f"DELETE FROM {table} WHERE {col}=?", (book_id,))
-
-            # Delete from books table
             conn.execute("DELETE FROM books WHERE id=?", (book_id,))
+        conn.execute("COMMIT")
+    except Exception:
+        try:
+            conn.execute("ROLLBACK")
+        except Exception:
+            pass
+        conn.close()
+        raise
 
-            # Delete book directory from disk (to Recycle Bin if send2trash available)
-            book_dir = library_path / book["path"]
-            if book_dir.exists():
+    # Phase 2: DB rows are committed — now remove the directories. A failure
+    # here leaves an orphan dir with its files intact (recoverable).
+    removed = []
+    for book in books:
+        entry = {
+            "id": book["id"],
+            "title": book["title"],
+            "author_sort": book["author_sort"],
+        }
+        book_dir = library_path / book["path"]
+        if book_dir.exists():
+            try:
                 if _use_trash:
                     _send2trash(str(book_dir))
                     logger.info(f"Sent to Recycle Bin: {book_dir}")
                 else:
                     shutil.rmtree(book_dir)
                     logger.info(f"Deleted permanently: {book_dir}")
+            except Exception as exc:
+                logger.exception(f"File removal failed for {book_dir}")
+                entry["file_removal_error"] = str(exc)
+        removed.append(entry)
 
-            removed.append({
-                "id": book_id,
-                "title": book["title"],
-                "author_sort": book["author_sort"],
-            })
-
-        conn.execute("COMMIT")
-    except Exception as exc:
-        if conn is not None:
-            try:
-                conn.execute("ROLLBACK")
-            except Exception:
-                pass
-            conn.close()
-        raise exc
-
-    # Books are committed; orphan cleanup is best-effort and reports its own status.
+    # Orphan cleanup is best-effort and reports its own status.
     try:
         orphan_result = _cleanup_orphans(conn)
     except Exception as exc:
@@ -412,12 +423,23 @@ def remove_books(
     try:
         removed, orphan_result = _remove_books_sqlite(backend, books)
         logger.info(f"Removed books: {[b['id'] for b in books]}")
-        return {
+        result = {
             "status": "success",
             "removed": removed,
             "missing_ids": missing_ids,
             "orphans_cleaned": orphan_result,
         }
+        file_errors = [r for r in removed if r.get("file_removal_error")]
+        if file_errors:
+            result["status"] = "partial_success"
+            result["file_removal_errors"] = len(file_errors)
+            result["warning"] = (
+                f"{len(file_errors)} book director(ies) could not be removed from disk; "
+                "their DB records are already deleted. The leftover directories keep "
+                "their files intact — list them with find_orphan_files and remove them "
+                "manually once verified."
+            )
+        return result
     except Exception as e:
         return {"status": "error", "message": str(e)}
 

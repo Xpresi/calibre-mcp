@@ -108,6 +108,7 @@ def fix_book_paths(
             LEFT JOIN books_authors_link bal ON bal.id = fa.min_id
             LEFT JOIN authors a ON a.id = bal.author
             WHERE b.id IN ({placeholders})
+            ORDER BY b.id
         """, tuple(book_ids))
     else:
         books = backend.query_db("""
@@ -119,6 +120,7 @@ def fix_book_paths(
             LEFT JOIN first_authors fa ON fa.book = b.id
             LEFT JOIN books_authors_link bal ON bal.id = fa.min_id
             LEFT JOIN authors a ON a.id = bal.author
+            ORDER BY b.id
         """)
 
     fixes = []
@@ -207,8 +209,6 @@ def fix_book_paths(
     total_fixes = len(fixes)
     if batch_size > 0:
         fixes = fixes[offset: offset + batch_size]
-    more_remaining = batch_size > 0 and (offset + batch_size) < total_fixes
-    next_offset    = offset + batch_size if more_remaining else None
 
     # Use incremental commits (COMMIT_EVERY books) so that partial progress is
     # preserved if the MCP call is cancelled (e.g. client-side timeout).
@@ -332,14 +332,24 @@ def fix_book_paths(
         "error_details": errors,
     }
     if batch_size > 0:
+        # The next scan no longer contains the fixes just applied — only the
+        # errored entries persist (at their ORDER BY b.id positions). So the
+        # next window must start at offset + len(errors), NOT offset +
+        # batch_size: advancing by the full batch size skips still-pending
+        # fixes that shifted forward when this batch's applied entries
+        # disappeared from the rescan (10k-fix simulation: the old protocol
+        # left 4,000 unfixed while reporting more_remaining=false).
+        untouched_tail = total_fixes - offset - len(fixes)
+        more_remaining = untouched_tail > 0
         result["more_remaining"] = more_remaining
         result["total_fixes_found"] = total_fixes
         if more_remaining:
+            next_offset = offset + len(errors)
             result["next_offset"] = next_offset
             result["message"] = (
-                f"Batch complete: applied {len(applied)}, "
-                f"{total_fixes - offset - len(applied) - len(errors)} more pending. "
-                f"Call again with offset={next_offset}."
+                f"Batch complete: applied {len(applied)}, {len(errors)} error(s), "
+                f"{untouched_tail} still pending. "
+                f"Call again with offset={next_offset} (the returned next_offset)."
             )
     return result
 

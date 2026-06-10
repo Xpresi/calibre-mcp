@@ -19,6 +19,15 @@ from .write import _set_metadata_sqlite
 
 logger = logging.getLogger("calibre_mcp")
 
+# Google Books returns ISO-639-1 codes ("es"); Calibre libraries key languages
+# by ISO-639-2/B ("spa"). Map common codes so apply=true doesn't create mixed
+# language rows alongside the library's canonical 3-letter ones.
+_LANG_ISO1_TO_ISO3 = {
+    "es": "spa", "en": "eng", "fr": "fra", "de": "deu", "it": "ita",
+    "pt": "por", "ca": "cat", "eu": "eus", "gl": "glg", "ru": "rus",
+    "ja": "jpn", "zh": "zho", "nl": "nld", "pl": "pol", "sv": "swe",
+}
+
 
 def _query_openlibrary(title: str, author: str) -> dict | None:
     """Query Open Library search API. Returns first result or None."""
@@ -145,7 +154,8 @@ def fetch_metadata(
                 date = found.get("publish_date") or f"{found['publish_year']}-01-01"
                 fields["pubdate"] = date
             if found.get("language"):
-                fields["languages"] = found["language"]
+                lang = str(found["language"]).lower()
+                fields["languages"] = _LANG_ISO1_TO_ISO3.get(lang, lang)
             if found.get("subjects") or found.get("categories"):
                 tags = found.get("subjects") or found.get("categories", [])
                 if tags:

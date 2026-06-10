@@ -103,7 +103,9 @@ def _coerce(name: str, args: dict[str, Any]) -> dict[str, Any]:
             out[key] = value.lower() in ("true", "yes", "1")
         elif intended == "array":
             try:
-                out[key] = json.loads(value)
+                parsed = json.loads(value)
+                # "38608" parses to a scalar — wrap it so handlers always get a list
+                out[key] = parsed if isinstance(parsed, list) else [parsed]
             except (json.JSONDecodeError, TypeError):
                 pass
         elif intended == "object":
@@ -683,7 +685,9 @@ TOOLS = [
             "bypassed calibredb (direct SQLite), which leaves directory names stale. "
             "Can target specific book_ids or scan all books. Dry-run by default. "
             "For large libraries (>10k fixes), use batch_size=3000 to avoid timeouts: "
-            "call repeatedly incrementing offset until more_remaining=false."
+            "call repeatedly passing the RETURNED next_offset as offset until "
+            "more_remaining=false (do NOT add batch_size to offset yourself — applied "
+            "fixes vanish from the next scan, so that would skip pending entries)."
         ),
         inputSchema={
             "type": "object",
