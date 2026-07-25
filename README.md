@@ -63,6 +63,13 @@ Edit `config.json` with your paths. The file is gitignored and will never be com
 }
 ```
 
+With `backup_before_bulk_ops` on, any tool that really writes to `metadata.db`
+(`dry_run=false`) copies the database to `metadata_backup_auto_<timestamp>.db`
+next to the library first, and reports the path alongside its result. A backup
+younger than 30 minutes is reused instead of re-copied, so a batched job does
+not produce one copy per call. If the backup cannot be written the operation is
+aborted rather than run unprotected.
+
 Platform defaults if `calibredb_path` is omitted:
 
 | Platform | Default path |
@@ -137,7 +144,7 @@ Or with uv:
 | `find_orphan_files` | Directories on disk with no matching DB record |
 | `find_ghost_books` | DB records pointing to non-existent directories |
 | `find_orphaned_metadata` | Authors/series/tags/publishers with no books |
-| `verify_file_integrity` | Confirm every DB-referenced file exists on disk (case-aware) |
+| `verify_file_integrity` | Confirm every DB-referenced file exists on disk (case-aware at both the author and book directory levels) |
 | `check_library` | Run Calibre's native integrity checker |
 
 ### ⚠️ Write — modifies your library

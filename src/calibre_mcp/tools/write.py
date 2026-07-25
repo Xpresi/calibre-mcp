@@ -15,10 +15,36 @@ logger = logging.getLogger("calibre_mcp")
 from ..backend import (  # noqa: E402
     BOOK_CHILD_TABLES,
     METADATA_TABLES,
+    UnsafeLibraryPath,
+    resolve_book_dir,
     _calibre_title_sort as _compute_title_sort,
 )
 
 _RELATIONAL_FIELDS = {"authors", "series", "publisher", "tags", "languages"}
+
+# Fields that feed the on-disk directory name ("Author/Title (id)"). Writing
+# them via SQLite updates the DB but leaves books.path — and the directory —
+# stale, which is the drift that started Incidente 1. The bulk tools already
+# said so; set_book_metadata and bulk_set_metadata are the ones people actually
+# use to edit titles and authors, and they said nothing.
+_PATH_AFFECTING_FIELDS = {"title", "authors"}
+
+
+def _path_drift_next_steps(book_ids: list[int]) -> dict[str, Any]:
+    """Follow-up steps for writes that make books.path stale."""
+    return {
+        "next_steps": [
+            "Run fix_book_paths(dry_run=true) to rename book directories on disk",
+            "Run verify_file_integrity to confirm files still resolve after the path update",
+            "Run embed_metadata on the affected book IDs so OPF files reflect the change "
+            "(otherwise restore_database from OPFs will recreate the old values)",
+        ],
+        "affected_book_ids": book_ids,
+        "warning": (
+            "title/authors changed: books.path and the directory on disk are now "
+            "stale. Run the next_steps before any orphan-file cleanup."
+        ),
+    }
 
 
 def _set_metadata_sqlite(backend, book_id: int, fields: dict, cleanup_orphans: bool = True) -> dict:
@@ -292,6 +318,10 @@ def _remove_books_sqlite(backend, books: list[dict]) -> tuple[list[dict], dict]:
     Sends book directories to the OS Recycle Bin (send2trash); falls back to
     permanent deletion only if send2trash is not installed. Per-book file
     removal failures are reported via "file_removal_error" on the entry.
+
+    Every path is re-validated with resolve_book_dir before it is touched, even
+    though remove_books already screened them — this is the last line before an
+    irreversible filesystem call, so it does not trust the caller.
     """
     import shutil
 
@@ -333,7 +363,14 @@ def _remove_books_sqlite(backend, books: list[dict]) -> tuple[list[dict], dict]:
             "title": book["title"],
             "author_sort": book["author_sort"],
         }
-        book_dir = library_path / book["path"]
+        try:
+            book_dir = resolve_book_dir(library_path, book["path"])
+        except UnsafeLibraryPath as exc:
+            logger.error(f"Refusing to remove files for book {book['id']}: {exc}")
+            entry["file_removal_error"] = f"unsafe path, files left untouched: {exc}"
+            removed.append(entry)
+            continue
+
         if book_dir.exists():
             try:
                 if _use_trash:
@@ -367,11 +404,16 @@ def _cleanup_orphans(conn: "sqlite3.Connection") -> dict:
     added later for that author/series/language, Calibre will recreate the record.
     Missing this step causes "Foreign key violation: language is still referenced"
     in Calibre GUI when the GUI tries to clean up a language after deleting a book.
+
+    Uses NOT EXISTS, not NOT IN: a single NULL in the link column makes
+    `id NOT IN (SELECT ...)` evaluate to NULL for every row, so the DELETE
+    silently matches nothing and the cleanup quietly stops working.
     """
     cleaned: dict[str, int] = {}
     for table, link_col, link_table, _display in METADATA_TABLES:
         cursor = conn.execute(
-            f"DELETE FROM {table} WHERE id NOT IN (SELECT {link_col} FROM {link_table})"
+            f"DELETE FROM {table} WHERE NOT EXISTS ("
+            f"  SELECT 1 FROM {link_table} l WHERE l.{link_col} = {table}.id)"
         )
         cleaned[table] = cursor.rowcount if cursor.rowcount >= 0 else 0
 
@@ -407,6 +449,29 @@ def remove_books(
 
     found_ids = {b["id"] for b in books}
     missing_ids = [bid for bid in book_ids if bid not in found_ids]
+
+    # Screen every path BEFORE deleting anything. A single unusable books.path
+    # aborts the whole call: a book whose path is empty or escapes the library
+    # would otherwise aim send2trash at the library root itself.
+    unsafe = []
+    for b in books:
+        try:
+            resolve_book_dir(backend.config.library_path, b["path"])
+        except UnsafeLibraryPath as exc:
+            unsafe.append({"id": b["id"], "title": b["title"],
+                           "path": b["path"], "reason": str(exc)})
+
+    if unsafe:
+        return {
+            "status": "aborted_unsafe_path",
+            "unsafe_paths": unsafe,
+            "message": (
+                f"{len(unsafe)} book(s) have a books.path that does not name a "
+                "directory inside the library. Nothing was removed — not even "
+                "database rows. Fix these paths (fix_book_paths, or repair them "
+                "in Calibre) before retrying."
+            ),
+        }
 
     if dry_run:
         return {
@@ -486,6 +551,8 @@ def set_book_metadata(
     try:
         result = _set_metadata_sqlite(backend, book_id, fields)
         result["book_id"] = book_id
+        if _PATH_AFFECTING_FIELDS & fields.keys():
+            result.update(_path_drift_next_steps([book_id]))
         return result
     except Exception as e:
         return {"status": "error", "message": str(e)}
@@ -547,11 +614,14 @@ def bulk_set_metadata(
 
     applied, errors = [], []
     touched_relational_any = False
+    path_affected_ids: list[int] = []
     for u in valid_updates:
         try:
             fields = u.get("fields", {})
             if _RELATIONAL_FIELDS & fields.keys():
                 touched_relational_any = True
+            if _PATH_AFFECTING_FIELDS & fields.keys():
+                path_affected_ids.append(u["book_id"])
             # Skip per-row cleanup; we run a single global cleanup at the end
             # so the cost is paid once instead of N times.
             result = _set_metadata_sqlite(backend, u["book_id"], fields, cleanup_orphans=False)
@@ -585,6 +655,10 @@ def bulk_set_metadata(
     }
     if orphans_cleaned is not None:
         result["orphans_cleaned"] = orphans_cleaned
+    applied_ids = {a["book_id"] for a in applied}
+    drifted = [bid for bid in path_affected_ids if bid in applied_ids]
+    if drifted:
+        result.update(_path_drift_next_steps(drifted))
     return result
 
 

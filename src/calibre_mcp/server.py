@@ -854,9 +854,60 @@ async def list_tools() -> list[Tool]:
 
 # ── Tool dispatch ──────────────────────────────────────────────────────
 
+# Tools that modify metadata.db. When config.backup_before_bulk_ops is on, a
+# backup is taken before any of these runs for real (dry_run=false). Tools that
+# only touch files (embed_metadata, backup_metadata_opf) are absent on purpose:
+# a metadata.db copy would not roll them back.
+_BACKUP_BEFORE = frozenset({
+    "remove_books",
+    "set_book_metadata",
+    "bulk_set_metadata",
+    "rename_author",
+    "merge_authors",
+    "normalize_uppercase",
+    "fix_series_numbers",
+    "fix_author_sort",
+    "fix_book_paths",
+    "cleanup_orphan_links",
+    "find_orphaned_metadata",
+    "vacuum_database",
+})
+
+
+def _needs_auto_backup(name: str, arguments: dict[str, Any]) -> bool:
+    """True when this call will really write to the DB (not a dry run)."""
+    if name not in _BACKUP_BEFORE:
+        return False
+    if name == "vacuum_database":
+        return True  # no dry_run parameter; always rewrites the file in place
+    return arguments.get("dry_run") is False
+
+
 @server.call_tool()
 async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
     arguments = _coerce(name, arguments)
+
+    auto_backup: dict[str, Any] | None = None
+    if _needs_auto_backup(name, arguments):
+        auto_backup = backend.auto_backup_if_due(name)
+        if auto_backup.get("status") == "error":
+            return _error_response(
+                f"Aborted {name}: backup_before_bulk_ops is enabled but the "
+                f"pre-operation backup failed ({auto_backup.get('error')}). "
+                "Nothing was modified. Fix the backup location or set "
+                "backup_before_bulk_ops to false to proceed without one."
+            )
+
+    response = await _dispatch(name, arguments)
+    if auto_backup and auto_backup.get("status") in ("created", "reused"):
+        response = response + [TextContent(
+            type="text",
+            text=json.dumps({"auto_backup": auto_backup}, indent=2, ensure_ascii=False),
+        )]
+    return response
+
+
+async def _dispatch(name: str, arguments: dict[str, Any]) -> list[TextContent]:
     try:
         match name:
             # Server info
@@ -1024,6 +1075,7 @@ async def run():
     logger.info(f"Library: {config.library_path}")
     logger.info(f"calibredb: {config.calibredb_path}")
     logger.info(f"Dry-run by default: {config.dry_run_by_default}")
+    logger.info(f"Auto-backup before write ops: {config.backup_before_bulk_ops}")
 
     async with stdio_server() as (read_stream, write_stream):
         await server.run(read_stream, write_stream, server.create_initialization_options())

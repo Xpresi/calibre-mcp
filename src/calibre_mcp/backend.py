@@ -2,15 +2,17 @@
 
 import json
 import logging
+import os
 import re
 import shutil
 import sqlite3
 import subprocess
 import sys
+import time
 import uuid
 from contextlib import contextmanager
 from datetime import datetime
-from pathlib import Path
+from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any
 
 from .config import Config
@@ -23,6 +25,12 @@ logger = logging.getLogger("calibre_mcp")
 # them, triggers on books/series (books_update_trg, series_update_trg, etc.)
 # fail with "no such function". We register Python equivalents so direct SQLite
 # writes work even when Calibre is closed.
+
+# Automatic pre-operation backups (config.backup_before_bulk_ops). Kept under a
+# distinct prefix so they are never confused with the manual backup_database()
+# copies, and reused within this window instead of re-copying per call.
+AUTO_BACKUP_PREFIX = "metadata_backup_auto_"
+AUTO_BACKUP_MAX_AGE_S = 30 * 60
 
 _ARTICLE_RE = re.compile(
     r'^(el|la|los|las|un|una|the|a|an|das|die|der|le|les|une)\s+',
@@ -50,9 +58,19 @@ def calibre_sanitize(s: str) -> str:
     Sanitize a string to a Calibre-compatible filesystem path component.
     Calibre replaces backslash, forward slash, colon, asterisk, question mark,
     double quote, angle brackets, pipe, AND periods with underscores on Windows.
+
+    Non-ASCII characters are deliberately NOT transliterated: this library keeps
+    accents in its directory names ("Gorodischer, Angélica" on disk for the
+    author of the same name — verified against 11,897 of 11,900 books with
+    accented authors). Asciizing here would declare every one of those paths
+    wrong and make fix_book_paths rename thousands of directories.
+
+    The trailing strip is repeated AFTER truncation: cutting at 200 can land on
+    a space or period, and Windows silently drops those from directory names, so
+    the created directory would never match the path written to the DB.
     """
     s = re.sub(r'[\\/:*?"<>|.]', '_', s)
-    return s.strip()[:200]
+    return s.strip()[:200].rstrip(" .")
 
 
 # ── Schema constants ────────────────────────────────────────────────────────
@@ -102,6 +120,68 @@ METADATA_TABLES: list[tuple[str, str, str, str]] = [
 class CalibreError(Exception):
     """Raised when a calibredb operation fails."""
     pass
+
+
+class UnsafeLibraryPath(CalibreError):
+    """Raised when a books.path value cannot be trusted to name a single book dir."""
+    pass
+
+
+def resolve_book_dir(library_path: str | Path, rel_path: str | None) -> Path:
+    """
+    Turn a books.path value into an absolute directory, refusing anything that
+    is not a real book directory strictly inside the library.
+
+    This is the guard against the failure mode behind both library-wipe
+    incidents: an empty/NULL books.path makes `library_path / path` collapse
+    onto the library ROOT itself (Path("D:/lib") / "" == Path("D:/lib")), so an
+    operation aimed at one book — send2trash, shutil.move — hits the whole
+    library instead. Absolute values and ".." traversal fail the same way.
+
+    A valid Calibre book path is always relative and exactly two components
+    ("Author/Title (id)"); anything else is rejected rather than guessed at.
+
+    Validation is purely lexical — no filesystem calls. fix_book_paths runs this
+    twice per book across the whole library (68k books here), and a Path.resolve()
+    per call turned a seconds-long scan into a multi-minute one. It also has to
+    stay lexical for correctness: resolve() rewrites a path to its on-disk casing
+    on Windows, erasing the very DB-vs-disk difference the case-fix code looks for.
+    """
+    root_str = os.path.abspath(str(library_path))
+    raw = (rel_path or "").strip()
+    if not raw:
+        raise UnsafeLibraryPath(
+            "books.path is empty — refusing to operate on the library root"
+        )
+
+    # Absoluteness is checked BEFORE stripping separators: "/etc/passwd" would
+    # otherwise be silently reinterpreted as the relative "etc/passwd".
+    slashed = raw.replace("\\", "/")
+    if PurePosixPath(slashed).is_absolute() or PureWindowsPath(raw).is_absolute():
+        raise UnsafeLibraryPath(f"books.path must be relative, got {rel_path!r}")
+
+    norm = slashed.strip("/")
+    if not norm:
+        raise UnsafeLibraryPath(f"books.path has no components: {rel_path!r}")
+
+    parts = [p for p in norm.split("/") if p and p != "."]
+    if any(p == ".." for p in parts):
+        raise UnsafeLibraryPath(f"books.path escapes the library: {rel_path!r}")
+    if len(parts) != 2:
+        raise UnsafeLibraryPath(
+            f"books.path must be 'Author/Title (id)' (2 components), "
+            f"got {len(parts)} in {rel_path!r}"
+        )
+
+    # Belt and braces: the checks above already make escaping impossible, but
+    # assert containment on the normalized string rather than trusting them.
+    candidate_str = os.path.normpath(os.path.join(root_str, *parts))
+    prefix = os.path.normcase(os.path.join(root_str, ""))
+    if not os.path.normcase(candidate_str).startswith(prefix):
+        raise UnsafeLibraryPath(
+            f"books.path {rel_path!r} resolves outside the library: {candidate_str}"
+        )
+    return Path(candidate_str)
 
 
 class CalibreBackend:
@@ -333,6 +413,57 @@ class CalibreBackend:
         shutil.copy2(self.db_path, backup_path)
         logger.info(f"Database backed up to: {backup_path}")
         return backup_path
+
+    def auto_backup_if_due(self, reason: str) -> dict[str, Any]:
+        """
+        Take the pre-operation backup promised by config.backup_before_bulk_ops.
+
+        Called by the tool dispatcher before any write tool actually executes
+        (dry_run=false). Until this existed, backup_before_bulk_ops was declared
+        in config.json and read by nothing — the setting promised a safety net
+        that was never there.
+
+        A fresh 107 MB copy per call would be wasteful when a bulk job is run in
+        batches, so a backup younger than AUTO_BACKUP_MAX_AGE_S is reused. That
+        is the safe direction: rolling back to a slightly older snapshot undoes
+        more, never less.
+
+        Returns {"status": "created"|"reused"|"disabled"|"error", ...}. Callers
+        MUST treat "error" as fatal and skip the operation — proceeding without
+        the backup is exactly what the setting exists to prevent.
+        """
+        if not self.config.backup_before_bulk_ops:
+            return {"status": "disabled"}
+
+        try:
+            db_dir = self.db_path.parent
+            newest, newest_age = None, None
+            for candidate in db_dir.glob(f"{AUTO_BACKUP_PREFIX}*.db"):
+                age = time.time() - candidate.stat().st_mtime
+                if newest_age is None or age < newest_age:
+                    newest, newest_age = candidate, age
+
+            if newest is not None and newest_age is not None and newest_age < AUTO_BACKUP_MAX_AGE_S:
+                return {
+                    "status": "reused",
+                    "backup_path": str(newest),
+                    "age_seconds": int(newest_age),
+                    "reason": reason,
+                }
+
+            stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            backup_path = db_dir / f"{AUTO_BACKUP_PREFIX}{stamp}.db"
+            shutil.copy2(self.db_path, backup_path)
+            logger.info(f"Auto-backup before {reason}: {backup_path}")
+            return {
+                "status": "created",
+                "backup_path": str(backup_path),
+                "size_mb": round(backup_path.stat().st_size / 1024 / 1024, 1),
+                "reason": reason,
+            }
+        except Exception as exc:
+            logger.exception(f"Auto-backup before {reason} failed")
+            return {"status": "error", "error": str(exc), "reason": reason}
 
     def vacuum_database(self) -> str:
         """Compact the database. Requires exclusive access (no Calibre running)."""

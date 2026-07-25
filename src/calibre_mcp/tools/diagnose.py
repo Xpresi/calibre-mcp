@@ -401,7 +401,16 @@ def find_orphan_files(
             return {
                 "source": "calibredb_check_library",
                 "raw_output": output.strip(),
+                "orphans": None,
+                "case_mismatches": None,
                 "message": "Parsed from calibredb check_library. See raw_output for details.",
+                "WARNING": (
+                    "This mode returns unstructured text: 'orphans' and "
+                    "'case_mismatches' are null, NOT empty. It does NOT distinguish "
+                    "real orphans from directories that merely have the wrong casing. "
+                    "Never delete anything based on this output — re-run with "
+                    "use_calibredb=false to get the classified lists first."
+                ),
             }
         except Exception as e:
             # Fall through to manual scan
@@ -414,8 +423,15 @@ def find_orphan_files(
     db_paths_exact = {r["path"].replace("/", os.sep) for r in rows}
     db_paths_lower = {p.lower() for p in db_paths_exact}
 
+    # The scan ALWAYS covers the whole library; `limit` caps only how many
+    # entries are listed back. Stopping the walk early (the previous behaviour)
+    # also truncated case_mismatches, so a partial scan could report
+    # case_mismatch_count=0 — a false all-clear on exactly the directories that
+    # must never be deleted.
     orphans = []
     case_mismatches = []
+    orphan_total = 0
+    case_mismatch_total = 0
     try:
         for author_dir in os.listdir(library_path):
             author_path = os.path.join(library_path, author_dir)
@@ -439,35 +455,53 @@ def find_orphan_files(
                     # Same path, different casing — this is NOT an orphan.
                     # It's a directory whose casing on disk doesn't match the DB.
                     # fix_book_paths should handle this. Never delete these.
-                    case_mismatches.append({
-                        "disk_path": book_path,
-                        "full_path": full_path,
-                        "file_count": file_count,
-                    })
+                    case_mismatch_total += 1
+                    if len(case_mismatches) < limit:
+                        case_mismatches.append({
+                            "disk_path": book_path,
+                            "full_path": full_path,
+                            "file_count": file_count,
+                        })
                 else:
                     # Truly not in DB — real orphan
-                    orphans.append({
-                        "path": book_path,
-                        "full_path": full_path,
-                        "file_count": file_count,
-                    })
-                    if len(orphans) >= limit:
-                        break
-            if len(orphans) >= limit:
-                break
+                    orphan_total += 1
+                    if len(orphans) < limit:
+                        orphans.append({
+                            "path": book_path,
+                            "full_path": full_path,
+                            "file_count": file_count,
+                        })
     except PermissionError as e:
-        return {"source": "filesystem_scan", "error": f"Permission denied: {e}"}
+        return {
+            "source": "filesystem_scan",
+            "scan_status": "INCOMPLETE",
+            "error": f"Permission denied: {e}",
+            "WARNING": (
+                "The scan stopped early. Counts are partial and CANNOT be read "
+                "as 'nothing else found'. Delete nothing based on this result."
+            ),
+        }
 
     result = {
         "source": "filesystem_scan",
+        "scan_status": "COMPLETE",
         "orphans": orphans,
-        "orphan_count": len(orphans),
+        "orphan_count": orphan_total,
         "case_mismatches": case_mismatches,
-        "case_mismatch_count": len(case_mismatches),
+        "case_mismatch_count": case_mismatch_total,
+        "listed_limit": limit,
     }
-    if case_mismatches:
+    if orphan_total > len(orphans) or case_mismatch_total > len(case_mismatches):
+        result["listing_truncated"] = True
+        result["listing_note"] = (
+            f"Whole library scanned, but only the first {limit} of each category "
+            f"are listed ({orphan_total} orphans, {case_mismatch_total} case "
+            "mismatches found in total). The counts are complete; raise `limit` "
+            "to see the rest."
+        )
+    if case_mismatch_total:
         result["case_mismatch_warning"] = (
-            f"{len(case_mismatches)} director(ies) have wrong casing on disk vs DB. "
+            f"{case_mismatch_total} director(ies) have wrong casing on disk vs DB. "
             "These are NOT orphans — run fix_book_paths to rename them. "
             "NEVER delete directories listed under case_mismatches."
         )
@@ -601,6 +635,51 @@ def find_ghost_books(
     return result
 
 
+def _find_case_mismatch(
+    library_path: str,
+    rel_path: str,
+    cache: dict[str, list[str]],
+) -> dict[str, str] | None:
+    """
+    Walk EVERY component of a book's relative path and return the first one
+    whose casing on disk differs from the DB, or None if all match.
+
+    Checking only the leaf (the book directory) is what made the Incidente 2
+    check useless: when the wrong casing is on the AUTHOR directory
+    ("ABAD, MERCEDES\\"), os.listdir of that directory still succeeds via
+    Windows' case-insensitive lookup and the book directory name matches, so
+    the mismatch went unseen and verify_file_integrity reported ok=True.
+
+    Returns {"level": "author"|"book", "expected": str, "actual": str} or None.
+    A component that does not exist in any casing is NOT a case mismatch — that
+    is a missing file, reported separately by the caller.
+    """
+    components = [c for c in rel_path.replace("/", os.sep).split(os.sep) if c]
+    levels = {0: "author", len(components) - 1: "book"}
+    parent = library_path
+
+    for depth, component in enumerate(components):
+        if parent not in cache:
+            try:
+                cache[parent] = os.listdir(parent)
+            except (PermissionError, OSError):
+                return None  # can't enumerate — no verdict rather than a wrong one
+        names = cache[parent]
+
+        if component not in names:
+            actual = next((n for n in names if n.lower() == component.lower()), None)
+            if actual is None:
+                return None  # absent entirely → the caller's "missing" path
+            return {
+                "level": levels.get(depth, f"depth_{depth}"),
+                "expected": component,
+                "actual": actual,
+            }
+        parent = os.path.join(parent, component)
+
+    return None
+
+
 def verify_file_integrity(
     backend,
     book_ids: list[int] | None = None,
@@ -643,6 +722,10 @@ def verify_file_integrity(
 
     missing = []
     case_mismatches = []
+    # One listdir per directory instead of one per format row — with 68k books
+    # sharing ~15k author directories the uncached version re-listed the same
+    # directories tens of thousands of times.
+    listdir_cache: dict[str, list[str]] = {}
 
     for r in rows:
         filename = f"{r['file_name']}.{r['format'].lower()}"
@@ -651,28 +734,16 @@ def verify_file_integrity(
 
         if os.path.exists(filepath):
             # File accessible — but on Windows NTFS this can be a false positive
-            # if the directory casing on disk differs from the DB path.
-            # Verify by checking the ACTUAL directory name via os.listdir.
-            parent = os.path.dirname(expected_dir)
-            dir_name = os.path.basename(expected_dir)
-            actual_names: list[str] | None = None
-            if os.path.isdir(parent):
-                try:
-                    actual_names = os.listdir(parent)
-                except (PermissionError, OSError):
-                    # Can't enumerate — skip case-mismatch check, trust os.path.exists
-                    actual_names = None
-            if actual_names is not None and dir_name not in actual_names:
-                # Accessible via case-insensitive lookup but casing differs
-                actual = next(
-                    (n for n in actual_names if n.lower() == dir_name.lower()),
-                    None,
-                )
+            # if ANY directory level's casing on disk differs from the DB path.
+            mismatch = _find_case_mismatch(library_path, r["path"], listdir_cache)
+            if mismatch:
                 case_mismatches.append({
                     "id": r["id"],
                     "title": r["title"],
                     "db_path": r["path"],
-                    "actual_dir_name": actual,
+                    "mismatch_level": mismatch["level"],
+                    "expected_dir_name": mismatch["expected"],
+                    "actual_dir_name": mismatch["actual"],
                     "filename": filename,
                 })
         else:
@@ -703,9 +774,14 @@ def verify_file_integrity(
         ),
     }
     if case_mismatches:
+        levels = defaultdict(int)
+        for cm in case_mismatches:
+            levels[cm["mismatch_level"]] += 1
         result["case_mismatches"] = case_mismatches[:50]
+        result["case_mismatch_levels"] = dict(levels)
         result["case_mismatch_warning"] = (
             "Directories with wrong casing are accessible on Windows but will cause "
-            "data loss if treated as orphans. Run fix_book_paths to rename them on disk."
+            "data loss if treated as orphans. Run fix_book_paths to rename them on disk. "
+            f"Levels affected: {dict(levels)} (author = the author directory itself)."
         )
     return result

@@ -11,7 +11,9 @@ from typing import Any
 from ..backend import (
     BOOK_CHILD_TABLES,
     METADATA_TABLES,
+    UnsafeLibraryPath,
     calibre_sanitize as _calibre_sanitize,
+    resolve_book_dir,
 )
 from ..utils.titlecase import smart_title_case, is_all_uppercase
 
@@ -93,7 +95,9 @@ def fix_book_paths(
         batch_size: Max fixes to apply per call (0 = unlimited). Use 3000 for large libs.
         offset: Skip the first N fixes (for pagination). Ignored when dry_run=True.
     """
-    library_path = Path(backend.config.library_path)
+    # abspath (not resolve) so this matches the root form resolve_book_dir
+    # returns — the `old_parent != library_path` guards below compare against it.
+    library_path = Path(os.path.abspath(backend.config.library_path))
 
     # Use a CTE to get each book's first author efficiently (avoids N correlated subqueries)
     if book_ids:
@@ -124,6 +128,7 @@ def fix_book_paths(
         """)
 
     fixes = []
+    unsafe_paths = []
     _listdir_cache: dict[str, list[str]] = {}  # cache os.listdir per parent dir
 
     for book in books:
@@ -134,6 +139,23 @@ def fix_book_paths(
         author_dir  = _calibre_sanitize(book["author_name"])
         book_dir    = _calibre_sanitize(f"{book['title']} ({book['id']})")
         expected_path = f"{author_dir}/{book_dir}"
+
+        # Both sides get validated: an empty books.path would make the move
+        # source the library root, and an author/title that sanitizes to an
+        # empty component would make the destination collapse the same way.
+        try:
+            resolve_book_dir(library_path, current_path)
+            resolve_book_dir(library_path, expected_path)
+        except UnsafeLibraryPath as exc:
+            unsafe_paths.append({
+                "id": book["id"],
+                "title": book["title"],
+                "author": book["author_name"],
+                "current_path": current_path,
+                "expected_path": expected_path,
+                "reason": str(exc),
+            })
+            continue
 
         if current_path == expected_path:
             # DB path matches expected — but the disk directory might have wrong
@@ -194,16 +216,29 @@ def fix_book_paths(
         })
 
     if dry_run:
-        return {
+        result = {
             "status":       "dry_run",
             "checked":      len(books),
             "fixes_needed": len(fixes),
             "fixes":        fixes[:100],
             "message":      f"Found {len(fixes)} path(s) to fix. Set dry_run=false to apply.",
         }
+        if unsafe_paths:
+            result["unsafe_paths"] = unsafe_paths[:100]
+            result["unsafe_path_count"] = len(unsafe_paths)
+            result["unsafe_path_warning"] = (
+                f"{len(unsafe_paths)} book(s) were SKIPPED because their path does not "
+                "name a directory inside the library. They are never moved or deleted; "
+                "repair them in Calibre."
+            )
+        return result
 
     if not fixes:
-        return {"status": "no_action", "message": "All paths are already correct."}
+        return {
+            "status": "no_action",
+            "message": "All paths are already correct.",
+            "unsafe_path_count": len(unsafe_paths),
+        }
 
     # Apply fixes — optionally in a batch window to avoid MCP timeouts on large libs.
     total_fixes = len(fixes)
@@ -222,8 +257,10 @@ def fix_book_paths(
 
         for fix in fixes:
             try:
-                current_full  = library_path / fix["current_path"]
-                expected_full = library_path / fix["expected_path"]
+                # Re-validated here too: this is the last point before an
+                # irreversible shutil.move/rmdir.
+                current_full  = resolve_book_dir(library_path, fix["current_path"])
+                expected_full = resolve_book_dir(library_path, fix["expected_path"])
 
                 is_case_only = (
                     fix["current_path"].lower() == fix["expected_path"].lower()
@@ -331,6 +368,9 @@ def fix_book_paths(
         "details":      applied,
         "error_details": errors,
     }
+    if unsafe_paths:
+        result["unsafe_paths"] = unsafe_paths[:100]
+        result["unsafe_path_count"] = len(unsafe_paths)
     if batch_size > 0:
         # The next scan no longer contains the fixes just applied — only the
         # errored entries persist (at their ORDER BY b.id positions). So the
@@ -1023,9 +1063,12 @@ def find_orphaned_metadata(
     for table, link_col, link_table, display_col in METADATA_TABLES:
         # display_col varies per table — 'name' for authors/series/tags/publishers,
         # 'lang_code' for languages (the languages table has no name column).
+        # NOT EXISTS rather than NOT IN — see _cleanup_orphans: one NULL in the
+        # link column makes NOT IN match zero rows and the check silently lies.
         rows = backend.query_db(
             f"SELECT {display_col} AS display FROM {table} "
-            f"WHERE id NOT IN (SELECT {link_col} FROM {link_table}) "
+            f"WHERE NOT EXISTS ("
+            f"  SELECT 1 FROM {link_table} l WHERE l.{link_col} = {table}.id) "
             f"ORDER BY {display_col}"
         )
         names = [r["display"] for r in rows]
@@ -1054,8 +1097,8 @@ def find_orphaned_metadata(
         for table, link_col, link_table, _display in METADATA_TABLES:
             if table in found:
                 cursor = conn.execute(
-                    f"DELETE FROM {table} "
-                    f"WHERE id NOT IN (SELECT {link_col} FROM {link_table})"
+                    f"DELETE FROM {table} WHERE NOT EXISTS ("
+                    f"  SELECT 1 FROM {link_table} l WHERE l.{link_col} = {table}.id)"
                 )
                 deleted[table] = cursor.rowcount
         conn.commit()

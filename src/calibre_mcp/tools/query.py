@@ -362,15 +362,19 @@ def raw_sql_query(
     """
     import re
 
-    # ── Safety: only allow SELECT ──────────────────────────────────────
+    # ── Safety: only allow SELECT (or a WITH…SELECT CTE) ───────────────
+    # WITH is accepted because a CTE is read-only in the forms that matter here:
+    # the keyword blocklist below still rejects WITH…DELETE/INSERT/UPDATE, and
+    # the connection itself is opened mode=ro. Rejecting WITH outright only
+    # blocked legitimate queries — the kind this module writes internally.
     normalized = sql.strip().lstrip(";").strip()
     first_word = re.split(r"\s+", normalized, maxsplit=1)[0].upper()
-    if first_word != "SELECT":
+    if first_word not in ("SELECT", "WITH"):
         return {
             "status": "error",
             "message": (
-                f"Only SELECT statements are allowed. Got: '{first_word}'. "
-                "Use the appropriate write tools for modifications."
+                f"Only SELECT (or WITH ... SELECT) statements are allowed. "
+                f"Got: '{first_word}'. Use the appropriate write tools for modifications."
             ),
         }
 
