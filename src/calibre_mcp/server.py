@@ -10,6 +10,7 @@ from mcp.server import Server
 from mcp.server.stdio import stdio_server
 from mcp.types import Tool, TextContent
 
+from . import __version__
 from .backend import CalibreBackend, CalibreError
 from .config import Config
 from .tools import query, diagnose, write, bulk, report, epub, analyze
@@ -1071,7 +1072,7 @@ async def run():
         logger.warning(f"Configuration warnings: {errors}")
         logger.warning("Some tools may fail. Fix config.json and restart.")
 
-    logger.info(f"Starting Calibre MCP Server v0.2.0")
+    logger.info(f"Starting Calibre MCP Server v{__version__}")
     logger.info(f"Library: {config.library_path}")
     logger.info(f"calibredb: {config.calibredb_path}")
     logger.info(f"Dry-run by default: {config.dry_run_by_default}")
