@@ -383,6 +383,30 @@ def find_orphan_links(backend) -> dict[str, int]:
     return results
 
 
+def _count_contents(path: str) -> tuple[int, int]:
+    """
+    Count files at ANY depth under `path`, plus its subdirectory count.
+
+    os.listdir at the top level only was actively dangerous here: a directory
+    whose files sit one level down reported file_count=0, which reads as "empty,
+    safe to delete". Emptiness is the single fact callers act on destructively,
+    so it has to be answered recursively.
+
+    Returns (total_files_at_any_depth, subdirectory_count).
+    """
+    files = 0
+    subdirs = 0
+    try:
+        for root, dirs, names in os.walk(path):
+            if root == path:
+                subdirs = len(dirs)
+            files += len(names)
+    except (PermissionError, OSError):
+        # Unreadable → report as non-empty so nothing treats it as deletable.
+        return (-1, -1)
+    return (files, subdirs)
+
+
 def find_orphan_files(
     backend,
     use_calibredb: bool = True,
@@ -446,10 +470,14 @@ def find_orphan_files(
                 if book_path in db_paths_exact:
                     continue  # exact match — all good
 
-                file_count = sum(
-                    1 for f in os.listdir(full_path)
-                    if os.path.isfile(os.path.join(full_path, f))
-                )
+                file_count, subdir_count = _count_contents(full_path)
+                entry_counts = {
+                    "file_count": file_count,
+                    "subdir_count": subdir_count,
+                    "recursively_empty": file_count == 0,
+                }
+                if file_count < 0:
+                    entry_counts["unreadable"] = True
 
                 if book_path.lower() in db_paths_lower:
                     # Same path, different casing — this is NOT an orphan.
@@ -460,7 +488,7 @@ def find_orphan_files(
                         case_mismatches.append({
                             "disk_path": book_path,
                             "full_path": full_path,
-                            "file_count": file_count,
+                            **entry_counts,
                         })
                 else:
                     # Truly not in DB — real orphan
@@ -469,7 +497,7 @@ def find_orphan_files(
                         orphans.append({
                             "path": book_path,
                             "full_path": full_path,
-                            "file_count": file_count,
+                            **entry_counts,
                         })
     except PermissionError as e:
         return {
@@ -490,6 +518,13 @@ def find_orphan_files(
         "case_mismatches": case_mismatches,
         "case_mismatch_count": case_mismatch_total,
         "listed_limit": limit,
+        "counts_are_recursive": True,
+        "deletion_note": (
+            "file_count counts files at ANY depth, so recursively_empty=true is "
+            "the only safe basis for deleting an orphan directory. Anything with "
+            "files may hold the ONLY copy of a book whose DB record points "
+            "elsewhere — check find_ghost_books/verify_file_integrity first."
+        ),
     }
     if orphan_total > len(orphans) or case_mismatch_total > len(case_mismatches):
         result["listing_truncated"] = True

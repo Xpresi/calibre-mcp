@@ -70,6 +70,24 @@ def _case_only_rename(parent: Path, current_name: str, target_name: str) -> dict
         return {"status": "error", "error": f"Case rename failed: {e}"}
 
 
+def _missing_format_files(backend, book_id: int, directory: Path) -> list[str]:
+    """
+    Return the book's format filenames that are NOT present in `directory`.
+
+    Used before repointing books.path at a directory the mover did not fill
+    itself: an existing directory is not evidence that the book is in it.
+    """
+    rows = backend.query_db(
+        "SELECT format, name FROM data WHERE book = ?", (book_id,)
+    )
+    missing = []
+    for r in rows:
+        filename = f"{r['name']}.{r['format'].lower()}"
+        if not (directory / filename).exists():
+            missing.append(filename)
+    return missing
+
+
 def fix_book_paths(
     backend,
     book_ids: list[int] | None = None,
@@ -325,7 +343,30 @@ def fix_book_paths(
                         errors.append({"id": fix["id"],
                                        "error": f"Directory not found: {fix['current_path']}"})
                         continue
-                    # else: expected already exists → just update DB path
+                    else:
+                        # Source gone, destination already there. Pointing the DB
+                        # at it is only correct if the book's format files are
+                        # actually inside — otherwise this blesses a ghost book:
+                        # books.path says "here", the files are somewhere else,
+                        # and the directory still holding them now looks like a
+                        # deletable orphan. That is the shape of book 44419
+                        # (Cortázar) found in the 2026-07 audit: DB path pointed
+                        # at a directory holding only metadata.opf while the epub
+                        # sat in the old author directory.
+                        missing = _missing_format_files(backend, fix["id"], expected_full)
+                        if missing:
+                            errors.append({
+                                "id": fix["id"],
+                                "error": (
+                                    f"Refusing to repoint books.path to "
+                                    f"{fix['expected_path']!r}: the directory exists but "
+                                    f"does not contain {missing}. The source "
+                                    f"{fix['current_path']!r} is gone, so the files are "
+                                    "elsewhere — find them (find_orphan_files) and move "
+                                    "them in before re-running."
+                                ),
+                            })
+                            continue
 
                 # Update books.path in DB
                 conn.execute("UPDATE books SET path=? WHERE id=?",

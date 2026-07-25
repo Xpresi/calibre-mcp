@@ -19,7 +19,7 @@ from types import SimpleNamespace
 import pytest
 
 from calibre_mcp.backend import calibre_sanitize
-from calibre_mcp.tools.bulk import find_orphaned_metadata
+from calibre_mcp.tools.bulk import find_orphaned_metadata, fix_book_paths
 from calibre_mcp.tools.diagnose import find_orphan_files
 from calibre_mcp.tools.query import raw_sql_query
 from calibre_mcp.tools.write import bulk_set_metadata, set_book_metadata
@@ -120,6 +120,35 @@ def test_no_case_mismatch_is_hidden_by_the_orphan_limit(library_with_many_orphan
     assert res["case_mismatch_count"] == 4
 
 
+def test_files_in_a_subdirectory_are_not_reported_as_empty(tmp_path):
+    """file_count came from a top-level os.listdir, so an orphan whose files sat
+    one level down reported 0 — which reads as 'empty, safe to delete'. Real
+    incident-shaped risk: an orphan directory can hold the only copy of a book."""
+    db = _empty_db(tmp_path)
+    nested = tmp_path / "Ghost" / "Book (99)" / "subdir"
+    nested.mkdir(parents=True)
+    (nested / "the_only_copy.epub").write_text("irreplaceable")
+
+    res = find_orphan_files(_make_backend(db), use_calibredb=False)
+
+    orphan = next(o for o in res["orphans"] if o["path"].endswith("Book (99)"))
+    assert orphan["file_count"] == 1, "files at depth must be counted"
+    assert orphan["subdir_count"] == 1
+    assert orphan["recursively_empty"] is False
+    assert res["counts_are_recursive"] is True
+
+
+def test_genuinely_empty_orphan_is_flagged_as_such(tmp_path):
+    db = _empty_db(tmp_path)
+    (tmp_path / "Ghost" / "Book (99)").mkdir(parents=True)
+
+    res = find_orphan_files(_make_backend(db), use_calibredb=False)
+
+    orphan = res["orphans"][0]
+    assert orphan["file_count"] == 0
+    assert orphan["recursively_empty"] is True
+
+
 def test_calibredb_mode_does_not_pretend_to_have_classified_anything(tmp_path):
     db = _empty_db(tmp_path)
     backend = _make_backend(db)
@@ -131,6 +160,60 @@ def test_calibredb_mode_does_not_pretend_to_have_classified_anything(tmp_path):
     assert res["orphans"] is None
     assert res["case_mismatches"] is None
     assert "WARNING" in res
+
+
+# ── fix_book_paths must not bless a ghost book ─────────────────────────────
+
+
+def _library_with_displaced_files(tmp_path):
+    """The book 44419 (Cortázar) shape found in the real library: the DB's
+    source directory is gone, the destination exists but holds only
+    metadata.opf, and the epub is sitting in a third directory."""
+    db = _empty_db(tmp_path)
+    conn = sqlite3.connect(str(db))
+    conn.execute("INSERT INTO authors (id,name,sort) VALUES (1,'Cortázar, Julio','Cortázar, Julio')")
+    conn.execute(
+        "INSERT INTO books (id,title,author_sort,path) VALUES "
+        "(1,'Modelo para armar','Julio Cortázar','Gone, Author/Modelo para armar (1)')"
+    )
+    conn.execute("INSERT INTO books_authors_link (book,author) VALUES (1,1)")
+    conn.execute("INSERT INTO data (book,format,name) VALUES (1,'EPUB','Modelo para armar')")
+    conn.commit()
+    conn.close()
+    dest = tmp_path / "Cortázar, Julio" / "Modelo para armar (1)"
+    dest.mkdir(parents=True)
+    (dest / "metadata.opf").write_text("<opf/>")   # destination exists but is not the book
+    stray = tmp_path / "Julio Cortázar" / "Modelo para armar (1)"
+    stray.mkdir(parents=True)
+    (stray / "Modelo para armar.epub").write_text("the only copy")
+    return _make_backend(db), dest, stray
+
+
+def test_refuses_to_repoint_path_at_a_directory_without_the_files(tmp_path):
+    backend, dest, stray = _library_with_displaced_files(tmp_path)
+
+    res = fix_book_paths(backend, dry_run=False)
+
+    assert res["errors"] == 1, res
+    assert "Modelo para armar.epub" in res["error_details"][0]["error"]
+    # books.path untouched: the DB must keep pointing at the broken-but-honest
+    # value rather than at a directory that does not hold the book.
+    path = backend.query_db("SELECT path FROM books WHERE id=1")[0]["path"]
+    assert path == "Gone, Author/Modelo para armar (1)"
+    # And the only copy of the epub is still where it was.
+    assert (stray / "Modelo para armar.epub").exists()
+
+
+def test_repoints_path_when_the_destination_really_holds_the_book(tmp_path):
+    backend, dest, stray = _library_with_displaced_files(tmp_path)
+    # Put the book where the DB is about to point.
+    (dest / "Modelo para armar.epub").write_text("the only copy")
+
+    res = fix_book_paths(backend, dry_run=False)
+
+    assert res["errors"] == 0, res
+    path = backend.query_db("SELECT path FROM books WHERE id=1")[0]["path"]
+    assert path == "Cortázar, Julio/Modelo para armar (1)"
 
 
 # ── NOT EXISTS instead of NOT IN ───────────────────────────────────────────
