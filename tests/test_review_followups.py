@@ -13,13 +13,14 @@
 """
 
 import sqlite3
+from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
 from calibre_mcp.backend import calibre_sanitize
-from calibre_mcp.tools.bulk import find_orphaned_metadata, fix_book_paths
+from calibre_mcp.tools.bulk import find_orphaned_metadata, fix_author_sort, fix_book_paths
 from calibre_mcp.tools.diagnose import find_orphan_files
 from calibre_mcp.tools.query import raw_sql_query
 from calibre_mcp.tools.write import bulk_set_metadata, set_book_metadata
@@ -58,11 +59,26 @@ def _make_backend(db_path: Path):
     def connect_write(timeout: int = 15):
         return sqlite3.connect(str(db_path), timeout=timeout)
 
+    @contextmanager
+    def write_transaction(timeout: int = 30):
+        """Mirrors CalibreBackend.write_transaction (minus the Calibre-open check)."""
+        conn = connect_write(timeout)
+        conn.execute("BEGIN")
+        try:
+            yield conn
+            conn.execute("COMMIT")
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
+        finally:
+            conn.close()
+
     return SimpleNamespace(
         db_path=db_path,
         config=SimpleNamespace(library_path=str(db_path.parent)),
         query_db=query_db,
         connect_write=connect_write,
+        write_transaction=write_transaction,
     )
 
 
@@ -214,6 +230,83 @@ def test_repoints_path_when_the_destination_really_holds_the_book(tmp_path):
     assert res["errors"] == 0, res
     path = backend.query_db("SELECT path FROM books WHERE id=1")[0]["path"]
     assert path == "Cortázar, Julio/Modelo para armar (1)"
+
+
+# ── fix_author_sort scans everything ───────────────────────────────────────
+
+
+def _library_with_stale_sorts(tmp_path, n_ok: int, n_bad: int):
+    """n_ok books already correct, then n_bad stale ones AFTER them, so a
+    scan capped at `limit * 10` books never reaches the broken ones."""
+    db = _empty_db(tmp_path)
+    conn = sqlite3.connect(str(db))
+    conn.execute("INSERT INTO authors (id,name,sort) VALUES (1,'Verne, Jules','Verne, Jules')")
+    conn.execute("INSERT INTO authors (id,name,sort) VALUES (2,'Lee, Tanith','Lee, Tanith')")
+    for i in range(1, n_ok + 1):
+        conn.execute("INSERT INTO books (id,title,author_sort,path) VALUES (?,?,'Verne, Jules',?)",
+                     (i, f"Ok{i}", f"Verne, Jules/Ok{i} ({i})"))
+        conn.execute("INSERT INTO books_authors_link (book,author) VALUES (?,1)", (i,))
+    for j in range(n_ok + 1, n_ok + n_bad + 1):
+        conn.execute("INSERT INTO books (id,title,author_sort,path) VALUES (?,?,'Tanith Lee',?)",
+                     (j, f"Bad{j}", f"Lee, Tanith/Bad{j} ({j})"))
+        conn.execute("INSERT INTO books_authors_link (book,author) VALUES (?,2)", (j,))
+    conn.commit()
+    conn.close()
+    return _make_backend(db)
+
+
+def test_stale_sorts_beyond_the_old_scan_window_are_found(tmp_path):
+    """Regression: the old scan read only `limit * 10` books, so the default
+    limit=100 examined 1,000 of 68,006 and could report a clean library while
+    thousands were stale."""
+    backend = _library_with_stale_sorts(tmp_path, n_ok=30, n_bad=5)
+
+    res = fix_author_sort(backend, limit=2, dry_run=True)
+
+    assert res["books_scanned"] == 35          # every book, not limit*10 == 20
+    assert res["total"] == 5                   # all stale ones found
+    assert res["would_fix"] == 2               # limit caps the fixing, not the scan
+
+
+def test_limit_zero_fixes_everything(tmp_path):
+    backend = _library_with_stale_sorts(tmp_path, n_ok=3, n_bad=7)
+
+    res = fix_author_sort(backend, limit=0, dry_run=False)
+
+    assert res["fixed"] == 7
+    assert res["total_found"] == 7
+    assert "remaining" not in res
+    left = backend.query_db("SELECT COUNT(*) c FROM books WHERE author_sort='Tanith Lee'")
+    assert left[0]["c"] == 0
+
+
+def test_partial_run_reports_what_is_left(tmp_path):
+    backend = _library_with_stale_sorts(tmp_path, n_ok=2, n_bad=6)
+
+    res = fix_author_sort(backend, limit=4, dry_run=False)
+
+    assert res["fixed"] == 4
+    assert res["total_found"] == 6
+    assert res["remaining"] == 2
+
+
+def test_multi_author_sort_uses_link_order(tmp_path):
+    db = _empty_db(tmp_path)
+    conn = sqlite3.connect(str(db))
+    conn.execute("INSERT INTO authors (id,name,sort) VALUES (1,'Niven, Larry','Niven, Larry')")
+    conn.execute("INSERT INTO authors (id,name,sort) VALUES (2,'Pournelle, Jerry','Pournelle, Jerry')")
+    conn.execute("INSERT INTO books (id,title,author_sort,path) VALUES (1,'T','WRONG','A/T (1)')")
+    # Insertion order defines the sort string; ids ascend with insertion.
+    conn.execute("INSERT INTO books_authors_link (id,book,author) VALUES (10,1,1)")
+    conn.execute("INSERT INTO books_authors_link (id,book,author) VALUES (11,1,2)")
+    conn.commit()
+    conn.close()
+    backend = _make_backend(db)
+
+    fix_author_sort(backend, limit=0, dry_run=False)
+
+    got = backend.query_db("SELECT author_sort FROM books WHERE id=1")[0]["author_sort"]
+    assert got == "Niven, Larry & Pournelle, Jerry"
 
 
 # ── NOT EXISTS instead of NOT IN ───────────────────────────────────────────

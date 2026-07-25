@@ -5,6 +5,7 @@ import os
 import shutil
 import sqlite3
 import uuid
+from collections import defaultdict
 from pathlib import Path
 from typing import Any
 
@@ -958,28 +959,36 @@ def fix_author_sort(
     Synchronize books.author_sort with the actual linked author's sort field.
     Fixes cases where author_sort is stale after author merges.
 
-    Instead of using GROUP_CONCAT (non-deterministic order), we query each book's
-    authors individually and build the correct sort string in Python with consistent
-    ordering by the link table's id column.
+    Instead of using GROUP_CONCAT (non-deterministic order), the correct sort
+    string is built in Python with consistent ordering by the link table's id
+    column.
+
+    The whole library is always scanned. The previous version fetched only
+    `limit * 10` books ("most won't be mismatches") and issued one query per
+    book: with the default limit=100 it examined 1,000 of 68,006 books, so a
+    clean result meant nothing, and a full pass cost ~17 minutes of per-book
+    round trips. Two set-based queries now cover every book in well under a
+    second, and `limit` caps only how many fixes are applied.
+
+    Args:
+        limit:   Max books to fix in this call (<= 0 means all of them).
+        dry_run: If True, only report.
     """
-    # Get all books that have authors linked
-    all_books = backend.query_db("""
-        SELECT b.id, b.title, b.author_sort
-        FROM books b
-        WHERE EXISTS (SELECT 1 FROM books_authors_link bal WHERE bal.book = b.id)
-        LIMIT ?
-    """, (limit * 10,))  # Fetch more than limit since most won't be mismatches
+    links = backend.query_db("""
+        SELECT bal.book AS book, a.name AS name, a.sort AS sort
+        FROM books_authors_link bal
+        JOIN authors a ON a.id = bal.author
+        ORDER BY bal.book, bal.id
+    """)
+    authors_by_book: dict[int, list[dict[str, Any]]] = defaultdict(list)
+    for r in links:
+        authors_by_book[r["book"]].append(r)
+
+    all_books = backend.query_db("SELECT id, title, author_sort FROM books")
 
     mismatches = []
     for book in all_books:
-        # Get authors in consistent order (by link table id = insertion order)
-        authors = backend.query_db("""
-            SELECT a.name, a.sort FROM books_authors_link bal
-            JOIN authors a ON bal.author = a.id
-            WHERE bal.book = ?
-            ORDER BY bal.id
-        """, (book["id"],))
-
+        authors = authors_by_book.get(book["id"])
         if not authors:
             continue
 
@@ -992,8 +1001,10 @@ def fix_author_sort(
                 "correct": correct_sort,
                 "author_names": [a["name"] for a in authors],
             })
-            if len(mismatches) >= limit:
-                break
+
+    total_found = len(mismatches)
+    if limit > 0:
+        mismatches = mismatches[:limit]
 
     if dry_run:
         return {
@@ -1001,10 +1012,16 @@ def fix_author_sort(
             "mismatches": [
                 {"id": m["id"], "title": m["title"],
                  "current": m["current"], "correct": m["correct"]}
-                for m in mismatches
+                for m in mismatches[:100]
             ],
-            "total": len(mismatches),
-            "message": f"Found {len(mismatches)} book(s) with stale author_sort. Set dry_run=false to fix.",
+            "total": total_found,
+            "would_fix": len(mismatches),
+            "books_scanned": len(all_books),
+            "message": (
+                f"Found {total_found} book(s) with stale author_sort across all "
+                f"{len(all_books)} books; this call would fix {len(mismatches)}. "
+                "Set dry_run=false to apply."
+            ),
         }
 
     # ── Apply via direct SQLite (calibredb times out on large libraries) ────
@@ -1018,11 +1035,19 @@ def fix_author_sort(
     except Exception as exc:
         return {"status": "error", "message": str(exc)}
 
-    return {
+    result = {
         "status": "completed",
         "fixed": len(mismatches),
+        "total_found": total_found,
         "errors": [],
     }
+    if total_found > len(mismatches):
+        result["remaining"] = total_found - len(mismatches)
+        result["message"] = (
+            f"Fixed {len(mismatches)} of {total_found} stale author_sort values. "
+            f"{result['remaining']} remain — call again (limit=0 fixes all)."
+        )
+    return result
 
 
 def cleanup_orphan_links(
