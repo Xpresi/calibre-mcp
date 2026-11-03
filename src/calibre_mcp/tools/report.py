@@ -2,6 +2,7 @@
 
 import json
 import logging
+import re
 import urllib.request
 import urllib.parse
 from datetime import datetime
@@ -16,6 +17,7 @@ from .diagnose import (
     find_orphan_links,
 )
 from .write import _set_metadata_sqlite
+from ..utils.normalize import normalize_for_grouping
 
 logger = logging.getLogger("calibre_mcp")
 
@@ -85,6 +87,41 @@ def _query_googlebooks(title: str, author: str) -> dict | None:
         return {"error": str(e)}
 
 
+# Calibre's "no date" sentinel for books.pubdate.
+_UNDEFINED_PUBDATE_PREFIX = "0101-01-01"
+
+
+def _title_key(title: str) -> set[str]:
+    """Significant title tokens: accent/case/punctuation-insensitive, no subtitle."""
+    main = re.split(r"[:(\[]", title or "", maxsplit=1)[0]
+    return {t for t in normalize_for_grouping(main).split() if len(t) > 2} or \
+           set(normalize_for_grouping(main).split())
+
+
+def _match_problem(book: dict, found: dict) -> str | None:
+    """
+    Return why `found` is NOT the same book, or None if it matches.
+
+    Both APIs return their top hit even when it is a different work, and the
+    old code applied it blindly. Require: the found title shares at least half
+    of the book's significant title tokens, and at least one author surname.
+    """
+    want = _title_key(book["title"])
+    got = _title_key(found.get("title") or "")
+    if not got or len(want & got) * 2 < len(want):
+        return f"title mismatch: {found.get('title')!r} vs {book['title']!r}"
+
+    book_tokens = set()
+    for name in book["authors"]:
+        book_tokens |= {t for t in normalize_for_grouping(name).split() if len(t) > 2}
+    found_tokens = set()
+    for name in found.get("authors") or []:
+        found_tokens |= {t for t in normalize_for_grouping(name).split() if len(t) > 2}
+    if not (book_tokens & found_tokens):
+        return f"author mismatch: {found.get('authors')} vs {book['authors']}"
+    return None
+
+
 def fetch_metadata(
     backend,
     book_ids: list[int],
@@ -98,11 +135,16 @@ def fetch_metadata(
     NOTE: calibredb has no fetch-metadata command. This tool queries
     Open Library and Google Books APIs directly.
 
+    With apply=True it only FILLS EMPTY fields (ISBN, publisher, pubdate,
+    language, tags) and only when the hit is verified to be the same book
+    (title + author check). It never replaces existing values: the previous
+    version wiped every tag and overwrote publisher/language with whatever
+    the API's top hit said, even when that hit was a different book.
+
     Args:
         book_ids: List of book IDs to look up
         source: 'openlibrary' or 'googlebooks' (default: openlibrary)
-        apply: If True and dry_run=False, apply found metadata to the books
-               via calibredb set_metadata
+        apply: If True and dry_run=False, fill empty fields with found metadata
         dry_run: If True, only show what would be fetched/changed
     """
     if not book_ids:
@@ -110,25 +152,34 @@ def fetch_metadata(
 
     placeholders = ",".join("?" * len(book_ids))
     books = backend.query_db(f"""
-        SELECT b.id, b.title, b.author_sort,
-               (SELECT i.val FROM identifiers i WHERE i.book = b.id AND i.type = 'isbn' LIMIT 1) as isbn
+        SELECT b.id, b.title, b.author_sort, b.pubdate,
+               (SELECT i.val FROM identifiers i WHERE i.book = b.id AND i.type = 'isbn' LIMIT 1) AS isbn,
+               (SELECT GROUP_CONCAT(a.name, char(31)) FROM books_authors_link ba
+                  JOIN authors a ON a.id = ba.author WHERE ba.book = b.id) AS author_names,
+               EXISTS (SELECT 1 FROM books_publishers_link WHERE book = b.id) AS has_publisher,
+               EXISTS (SELECT 1 FROM books_languages_link  WHERE book = b.id) AS has_language,
+               EXISTS (SELECT 1 FROM books_tags_link       WHERE book = b.id) AS has_tags
         FROM books b WHERE b.id IN ({placeholders})
     """, tuple(book_ids))
 
     if not books:
         return {"status": "error", "message": "No books found for given IDs."}
 
+    for b in books:
+        # Calibre stores commas inside author names as '|'.
+        b["authors"] = [n.replace("|", ",") for n in (b.get("author_names") or "").split("\x1f") if n]
+
     if dry_run:
         return {
             "status": "dry_run",
             "books": [{"id": b["id"], "title": b["title"],
-                       "author_sort": b["author_sort"], "isbn": b["isbn"]}
+                       "authors": b["authors"], "isbn": b["isbn"]}
                       for b in books],
             "source": source,
             "message": (
                 f"Would query {source} for {len(books)} book(s). "
                 f"Set dry_run=false to execute. "
-                f"Set apply=true to also write found metadata back to the library."
+                f"Set apply=true to also fill EMPTY fields from verified matches."
             ),
         }
 
@@ -136,7 +187,8 @@ def fetch_metadata(
     results = []
 
     for book in books:
-        found = query_fn(book["title"], book["author_sort"])
+        author_query = book["authors"][0] if book["authors"] else (book["author_sort"] or "")
+        found = query_fn(book["title"], author_query)
         entry = {
             "id": book["id"],
             "title": book["title"],
@@ -144,22 +196,25 @@ def fetch_metadata(
             "applied": False,
         }
 
-        if apply and found and "error" not in found:
+        mismatch = _match_problem(book, found) if found and "error" not in found else None
+        if mismatch:
+            entry["match_rejected"] = mismatch
+
+        if apply and found and "error" not in found and not mismatch:
             fields = {}
             if found.get("isbn") and not book["isbn"]:
                 fields["identifiers"] = f"isbn:{found['isbn']}"
-            if found.get("publisher"):
+            if found.get("publisher") and not book["has_publisher"]:
                 fields["publisher"] = found["publisher"]
-            if found.get("publish_date") or found.get("publish_year"):
-                date = found.get("publish_date") or f"{found['publish_year']}-01-01"
-                fields["pubdate"] = date
-            if found.get("language"):
+            pubdate_empty = not book["pubdate"] or str(book["pubdate"]).startswith(_UNDEFINED_PUBDATE_PREFIX)
+            if pubdate_empty and (found.get("publish_date") or found.get("publish_year")):
+                fields["pubdate"] = found.get("publish_date") or f"{found['publish_year']}-01-01"
+            if found.get("language") and not book["has_language"]:
                 lang = str(found["language"]).lower()
                 fields["languages"] = _LANG_ISO1_TO_ISO3.get(lang, lang)
-            if found.get("subjects") or found.get("categories"):
-                tags = found.get("subjects") or found.get("categories", [])
-                if tags:
-                    fields["tags"] = ",".join(tags[:5])
+            tags = found.get("subjects") or found.get("categories") or []
+            if tags and not book["has_tags"]:
+                fields["tags"] = ",".join(t.replace(",", " ") for t in tags[:5])
 
             if fields:
                 try:
@@ -169,6 +224,8 @@ def fetch_metadata(
                     entry["changes"] = result.get("changes", [])
                 except Exception as e:
                     entry["apply_error"] = str(e)
+            else:
+                entry["skipped"] = "no empty fields to fill"
 
         results.append(entry)
 
@@ -177,6 +234,7 @@ def fetch_metadata(
         "source": source,
         "results": results,
         "found": sum(1 for r in results if r["found"] and "error" not in r["found"]),
+        "rejected_mismatches": sum(1 for r in results if r.get("match_rejected")),
         "applied": sum(1 for r in results if r["applied"]),
     }
 

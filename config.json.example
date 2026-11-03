@@ -11,6 +11,5 @@
     "_library_path_mac":     "/Users/yourname/Calibre Library",
     "library_path": "C:\\Users\\YourName\\Calibre Library",
 
-    "backup_before_bulk_ops": true,
-    "dry_run_by_default": true
+    "backup_before_bulk_ops": true
 }

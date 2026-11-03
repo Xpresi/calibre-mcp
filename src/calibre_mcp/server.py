@@ -101,7 +101,15 @@ def _coerce(name: str, args: dict[str, Any]) -> dict[str, Any]:
             except (ValueError, TypeError):
                 pass
         elif intended == "boolean":
-            out[key] = value.lower() in ("true", "yes", "1")
+            # Strict: an unrecognised string used to become False, which for
+            # dry_run means "really do it". Refuse instead of guessing.
+            v = value.strip().lower()
+            if v in ("true", "yes", "1"):
+                out[key] = True
+            elif v in ("false", "no", "0"):
+                out[key] = False
+            else:
+                raise ValueError(f"{key}: expected a boolean, got {value!r}")
         elif intended == "array":
             try:
                 parsed = json.loads(value)
@@ -710,7 +718,9 @@ TOOLS = [
         description=(
             "Fetch metadata from the internet (Open Library or Google Books) for specified books. "
             "calibredb has no fetch-metadata command — this queries APIs directly. "
-            "With apply=true and dry_run=false, writes found metadata back via calibredb set_metadata."
+            "With apply=true and dry_run=false, fills ONLY EMPTY fields (ISBN, publisher, pubdate, "
+            "language, tags) and only from hits verified to match the book's title and author. "
+            "Existing values are never overwritten; mismatched hits are reported as match_rejected."
         ),
         inputSchema={
             "type": "object",
@@ -872,6 +882,7 @@ _BACKUP_BEFORE = frozenset({
     "cleanup_orphan_links",
     "find_orphaned_metadata",
     "vacuum_database",
+    "fetch_metadata",  # only with apply=true, see _needs_auto_backup
 })
 
 
@@ -881,12 +892,19 @@ def _needs_auto_backup(name: str, arguments: dict[str, Any]) -> bool:
         return False
     if name == "vacuum_database":
         return True  # no dry_run parameter; always rewrites the file in place
-    return arguments.get("dry_run") is False
+    if name == "fetch_metadata" and not arguments.get("apply"):
+        return False  # without apply it only reads from the internet
+    # Every write tool defaults dry_run to True, so absent means dry run. Any
+    # falsy value (False, 0) means a real write — `is False` missed 0.
+    return not arguments.get("dry_run", True)
 
 
 @server.call_tool()
 async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
-    arguments = _coerce(name, arguments)
+    try:
+        arguments = _coerce(name, arguments or {})
+    except ValueError as exc:
+        return _error_response(f"Invalid arguments for {name}: {exc}")
 
     auto_backup: dict[str, Any] | None = None
     if _needs_auto_backup(name, arguments):
@@ -1075,7 +1093,6 @@ async def run():
     logger.info(f"Starting Calibre MCP Server v{__version__}")
     logger.info(f"Library: {config.library_path}")
     logger.info(f"calibredb: {config.calibredb_path}")
-    logger.info(f"Dry-run by default: {config.dry_run_by_default}")
     logger.info(f"Auto-backup before write ops: {config.backup_before_bulk_ops}")
 
     async with stdio_server() as (read_stream, write_stream):

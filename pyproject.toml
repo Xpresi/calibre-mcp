@@ -21,7 +21,7 @@ classifiers = [
     "Topic :: System :: Filesystems",
 ]
 dependencies = [
-    "mcp[cli]>=1.0.0",
+    "mcp[cli]>=1.0.0,<2",  # 2.x renamed Tool.inputSchema → input_schema
     "send2trash>=1.8.0",
 ]
 
