@@ -1,5 +1,48 @@
 # Changelog
 
+## Unreleased
+
+### Fixed — data loss risks
+
+- **`fix_book_paths` no longer splits a book across two directories.** When the
+  destination already existed it moved the free names, skipped the rest, then
+  `rmdir()` failed on the leftover `metadata.opf`/`cover.jpg` — after the epub
+  had moved. `books.path` kept the old directory (a ghost book) and every
+  re-run hit the same error. The merge is now planned first: identical
+  duplicates are dropped, any differing file or directory collision aborts
+  with nothing moved.
+- **`fetch_metadata(apply=true)` only fills empty fields, from verified hits.**
+  It used to delete all of a book's tags and overwrite publisher/language with
+  the API's top hit, even when that hit was a different book. Hits now need a
+  title and author match (`match_rejected` otherwise), searches use the
+  author's display name, and the call takes an automatic backup.
+- **The "Calibre is closed" guard fails closed.** If `tasklist`/`pgrep` could
+  not run it answered "closed". It now refuses to write, also detects
+  `calibre-server`, and `vacuum_database` checks it too.
+- **Backups use SQLite's backup API** instead of a raw file copy, which missed
+  committed pages still in `metadata.db-wal`. Backups are written to a
+  `.partial` name and renamed on success.
+- **Write connections no longer switch the library to WAL.** `journal_mode` is
+  persistent; the library's own mode is now left alone.
+- **Boolean arguments are parsed strictly.** An unrecognised string such as
+  `dry_run="dry"` became `False` — a real run. It is now rejected. A
+  `dry_run=0` now also triggers the automatic backup.
+
+### Fixed — other
+
+- `mcp` is pinned to `<2`: mcp 2.x renamed `Tool.inputSchema`, so a fresh
+  install could not even import the server.
+- Authors created by `set_book_metadata`/`bulk_set_metadata` get a proper
+  `Last, First` sort instead of their display name; existing-author lookup
+  prefers an exact name match.
+- `remove_books` dry run lists the directory each book would remove.
+
+### Removed
+
+- `dry_run_by_default`. It was never read by anything; wiring it up would have
+  let a call that omits `dry_run` delete books. A config that still sets it
+  logs a warning.
+
 ## 0.3.0 — 2026-07-25
 
 Safety release. Every change below came out of auditing the server against a

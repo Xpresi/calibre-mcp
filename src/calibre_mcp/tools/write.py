@@ -47,6 +47,28 @@ def _path_drift_next_steps(book_ids: list[int]) -> dict[str, Any]:
     }
 
 
+_AUTHOR_SUFFIXES = {"jr", "jr.", "sr", "sr.", "ii", "iii", "iv"}
+
+
+def _author_sort_key(name: str) -> str:
+    """
+    'Stephen King' → 'King, Stephen'; 'Martin Luther King Jr.' → 'King, Martin Luther Jr.'.
+    Names already in 'Last, First' form or single-token names are kept as-is.
+    New authors used to get sort = display name, which put every author
+    created through this tool under its first name.
+    """
+    name = name.strip()
+    if "," in name:
+        return name
+    tokens = name.split()
+    suffix = []
+    while len(tokens) > 2 and tokens[-1].lower() in _AUTHOR_SUFFIXES:
+        suffix.insert(0, tokens.pop())
+    if len(tokens) < 2:
+        return name
+    return " ".join([f"{tokens[-1]},", *tokens[:-1], *suffix])
+
+
 def _set_metadata_sqlite(backend, book_id: int, fields: dict, cleanup_orphans: bool = True) -> dict:
     """
     Apply metadata changes directly via SQLite.
@@ -89,22 +111,25 @@ def _set_metadata_sqlite(backend, book_id: int, fields: dict, cleanup_orphans: b
 
             for aname in author_names:
                 # Find existing author by sort key or exact name
+                # Exact name wins over a sort-key match; without the ORDER BY
+                # the LIMIT 1 picked whichever row SQLite happened to return.
                 row = conn.execute(
                     "SELECT id, name, sort FROM authors "
-                    "WHERE sort=? OR name=? LIMIT 1",
-                    (aname, aname),
+                    "WHERE name=? OR sort=? ORDER BY (name=?) DESC, id LIMIT 1",
+                    (aname, aname, aname),
                 ).fetchone()
 
                 if row:
                     aid, aname_canon, asort = row
                 else:
                     # Create new author entry
+                    asort = _author_sort_key(aname)
                     conn.execute(
                         "INSERT INTO authors(name, sort, link) VALUES(?,?,'')",
-                        (aname, aname),
+                        (aname, asort),
                     )
                     aid = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
-                    aname_canon, asort = aname, aname
+                    aname_canon = aname
 
                 author_ids.append(aid)
                 author_sort_keys.append(asort)
@@ -477,7 +502,8 @@ def remove_books(
         return {
             "status": "dry_run",
             "would_remove": [
-                {"id": b["id"], "title": b["title"], "author_sort": b["author_sort"]}
+                {"id": b["id"], "title": b["title"], "author_sort": b["author_sort"],
+                 "directory": str(resolve_book_dir(backend.config.library_path, b["path"]))}
                 for b in books
             ],
             "missing_ids": missing_ids,

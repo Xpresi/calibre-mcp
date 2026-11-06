@@ -89,6 +89,59 @@ def _missing_format_files(backend, book_id: int, directory: Path) -> list[str]:
     return missing
 
 
+def _same_file(a: Path, b: Path) -> bool:
+    """True when two regular files have identical contents."""
+    import filecmp
+    return a.is_file() and b.is_file() and filecmp.cmp(str(a), str(b), shallow=False)
+
+
+def _merge_book_dir(src: Path, dst: Path) -> dict[str, Any]:
+    """
+    Merge a book directory into an already-existing destination, all or nothing.
+
+    The previous inline merge moved every child whose name was free in `dst`,
+    skipped the rest, then called src.rmdir(). Both directories almost always
+    hold metadata.opf and cover.jpg, so rmdir failed with "Directory not
+    empty" AFTER the epub had already moved — leaving books.path pointing at a
+    directory without the book file (a ghost) and a re-run stuck on the same
+    error forever.
+
+    Now the whole merge is planned before anything moves:
+      - a child absent from dst is moved;
+      - a child present in dst with byte-identical contents is a duplicate, and
+        the src copy is deleted once everything else has moved;
+      - a child present in dst with DIFFERENT contents (or any directory
+        collision) is a conflict — nothing at all is touched and CalibreError
+        is raised listing the conflicts.
+    On success src no longer exists.
+    """
+    from ..backend import CalibreError
+
+    to_move, duplicates, conflicts = [], [], []
+    for child in src.iterdir():
+        dest = dst / child.name
+        if not dest.exists():
+            to_move.append(child)
+        elif _same_file(child, dest):
+            duplicates.append(child)
+        else:
+            conflicts.append(child.name)
+
+    if conflicts:
+        raise CalibreError(
+            f"Cannot merge {src.name!r} into existing {dst.name!r}: "
+            f"{sorted(conflicts)} exist in both with different contents. "
+            "Nothing was moved. Resolve these by hand, then re-run."
+        )
+
+    for child in to_move:
+        shutil.move(str(child), str(dst / child.name))
+    for child in duplicates:
+        child.unlink()
+    src.rmdir()
+    return {"moved": [c.name for c in to_move], "dropped_duplicates": [c.name for c in duplicates]}
+
+
 def fix_book_paths(
     backend,
     book_ids: list[int] | None = None,
@@ -324,12 +377,9 @@ def fix_book_paths(
                         expected_full.parent.mkdir(parents=True, exist_ok=True)
 
                         if expected_full.exists():
-                            # Target already exists: merge files (don't overwrite)
-                            for child in current_full.iterdir():
-                                dest = expected_full / child.name
-                                if not dest.exists():
-                                    shutil.move(str(child), str(dest))
-                            current_full.rmdir()
+                            # Target already exists: all-or-nothing merge. Raises
+                            # before moving anything if contents conflict.
+                            _merge_book_dir(current_full, expected_full)
                         else:
                             shutil.move(str(current_full), str(expected_full))
 

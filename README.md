@@ -58,8 +58,7 @@ Edit `config.json` with your paths. The file is gitignored and will never be com
 {
     "calibredb_path": "C:\\Program Files\\Calibre2\\calibredb.exe",
     "library_path":   "C:\\Users\\YourName\\Calibre Library",
-    "backup_before_bulk_ops": true,
-    "dry_run_by_default":     true
+    "backup_before_bulk_ops": true
 }
 ```
 
@@ -195,18 +194,18 @@ Compose lower-level tools into one-shot answers, useful when iterating on author
 
 - **Dry-run by default**: every destructive tool returns a preview unless `dry_run=false` is explicitly set
 - **Calibre-closed check**: direct SQLite write operations verify the Calibre GUI is not running before touching the database
-- **`remove_books` deletes physical files**: it removes the book's DB records (via direct SQLite) and sends the book directory to the OS Recycle Bin / Trash through `send2trash`. Deletions are therefore recoverable until the bin is emptied; if `send2trash` is unavailable it falls back to permanent removal. Use `dry_run=true` to preview exactly which files will be removed before confirming.
+- **`remove_books` deletes physical files**: it removes the book's DB records (via direct SQLite) and sends the book directory to the OS Recycle Bin / Trash through `send2trash`. Deletions are therefore recoverable until the bin is emptied; if `send2trash` is unavailable it falls back to permanent removal. Use `dry_run=true` to preview exactly which book directories will be removed before confirming.
 - **`backup_database` only backs up `metadata.db`**, not the physical book files. For full library backups, copy the entire library folder manually.
 
 ## Running tests
 
 ```bash
-# Unit tests (no Calibre installation needed)
-pytest tests/test_normalize.py -v
-
-# Integration tests (requires a real metadata.db)
-pytest tests/test_backend.py -v
+pip install -e . pytest
+pytest
 ```
+
+The suite builds throwaway libraries in temporary directories; it needs neither
+Calibre nor a real `metadata.db`.
 
 ## License
 

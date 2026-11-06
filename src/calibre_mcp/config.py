@@ -1,6 +1,7 @@
 """Configuration loader for Calibre MCP Server."""
 
 import json
+import logging
 import os
 import sys
 from dataclasses import dataclass, field
@@ -22,7 +23,6 @@ class Config:
     calibredb_path: str = ""
     library_path: str = ""
     backup_before_bulk_ops: bool = True
-    dry_run_by_default: bool = True
     operations_log: str = ""  # Path to JSONL operations log; defaults to <library>/calibre_operations.jsonl
 
     def __post_init__(self):
@@ -46,6 +46,14 @@ class Config:
         if config_path and Path(config_path).exists():
             with open(config_path, "r", encoding="utf-8") as f:
                 data = json.load(f)
+            if "dry_run_by_default" in data:
+                # Never implemented: every write tool is dry-run unless the call
+                # passes dry_run=false explicitly. Removed rather than wired up,
+                # because "false" would let a call that omits dry_run delete books.
+                logging.getLogger("calibre_mcp").warning(
+                    "config.json: 'dry_run_by_default' is ignored and can be removed — "
+                    "write tools always default to dry_run=true."
+                )
             return cls(**{k: v for k, v in data.items() if k in cls.__dataclass_fields__})
 
         return cls()

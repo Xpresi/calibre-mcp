@@ -4,7 +4,6 @@ import json
 import logging
 import os
 import re
-import shutil
 import sqlite3
 import subprocess
 import sys
@@ -293,34 +292,52 @@ class CalibreBackend:
 
     # ── Calibre process detection ──────────────────────────────────────
 
+    # Processes that keep metadata.db open: the GUI and the content server.
+    _CALIBRE_PROCESSES = ("calibre", "calibre-server")
+
     def is_calibre_running(self) -> bool:
-        """Return True if the Calibre GUI process is currently running."""
+        """
+        Return True if the Calibre GUI or content server is running.
+
+        Raises CalibreError when the check itself cannot run. It used to return
+        False in that case — "can't tell" became "safe to write", the one
+        answer a guard must never default to.
+        """
         try:
             if sys.platform == "win32":
-                # Use shell=True so cmd.exe handles the /FI flag correctly
-                # regardless of whether we're running under Git bash or cmd.
                 result = subprocess.run(
-                    'tasklist /FI "IMAGENAME eq calibre.exe" /NH',
-                    shell=True,
-                    capture_output=True, text=True, timeout=5,
+                    ["tasklist", "/FO", "CSV", "/NH"],
+                    capture_output=True, text=True, timeout=10,
                 )
-                return "calibre.exe" in result.stdout.lower()
-            else:
-                # Linux / macOS
-                result = subprocess.run(
-                    ["pgrep", "-x", "calibre"],
-                    capture_output=True, timeout=5,
-                )
-                return result.returncode == 0
-        except Exception:
-            return False  # Can't check → assume closed, let SQLite catch real locks
+                if result.returncode != 0:
+                    raise OSError(f"tasklist rc={result.returncode}: {result.stderr.strip()}")
+                running = {
+                    line.split('","', 1)[0].strip('"').lower()
+                    for line in result.stdout.splitlines() if line.strip()
+                }
+                return any(f"{p}.exe" in running for p in self._CALIBRE_PROCESSES)
+
+            # Linux / macOS. pgrep: rc 0 = match, 1 = no match, >1 = error.
+            result = subprocess.run(
+                ["pgrep", "-x", "|".join(self._CALIBRE_PROCESSES)],
+                capture_output=True, timeout=10,
+            )
+            if result.returncode > 1:
+                raise OSError(f"pgrep rc={result.returncode}")
+            return result.returncode == 0
+        except Exception as exc:
+            raise CalibreError(
+                f"Could not verify that Calibre is closed ({exc}); refusing to write. "
+                "Make sure Calibre and calibre-server are closed and that "
+                "tasklist/pgrep is available."
+            ) from exc
 
     def require_calibre_closed(self) -> None:
-        """Raise CalibreError if the Calibre GUI is open."""
+        """Raise CalibreError if the Calibre GUI or content server is open."""
         if self.is_calibre_running():
             raise CalibreError(
-                "Calibre is currently open. Close it before running write operations "
-                "that access the database directly."
+                "Calibre (GUI or calibre-server) is currently running. Close it before "
+                "running write operations that access the database directly."
             )
 
     def log_operation(
@@ -347,7 +364,10 @@ class CalibreBackend:
         """
         Open a writable SQLite connection to metadata.db.
 
-        Verifies Calibre is closed first, then opens the connection in WAL mode.
+        Verifies Calibre is closed first. The journal mode is left as the
+        library has it: journal_mode=WAL is persistent, so setting it here used
+        to convert the user's metadata.db for good (and leaves -wal/-shm files
+        that a plain file copy of metadata.db does not capture).
         Use this instead of sqlite3.connect() for all direct write operations.
 
         Registers Calibre's custom SQLite functions so DB triggers don't fail:
@@ -358,7 +378,6 @@ class CalibreBackend:
         """
         self.require_calibre_closed()
         conn = sqlite3.connect(str(self.db_path), timeout=timeout)
-        conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA foreign_keys = ON")
         conn.create_function("title_sort", 1, _calibre_title_sort)
         conn.create_function("uuid4", 0, _calibre_uuid4)
@@ -405,12 +424,33 @@ class CalibreBackend:
 
     # ── Utility methods ────────────────────────────────────────────────
 
+    def _sqlite_copy(self, dest: Path) -> None:
+        """
+        Consistent copy of metadata.db via SQLite's online backup API.
+
+        shutil.copy2 copied only the main file: committed pages still sitting in
+        a -wal file were silently missing from the "backup". The backup API
+        reads through SQLite, so the copy is a consistent snapshot. Written to a
+        temp name and renamed so a failed copy never looks like a good backup.
+        """
+        tmp = dest.with_name(dest.name + ".partial")
+        src = sqlite3.connect(f"file:{self.db_path}?mode=ro", uri=True, timeout=30)
+        try:
+            dst = sqlite3.connect(str(tmp))
+            try:
+                src.backup(dst)
+            finally:
+                dst.close()
+        finally:
+            src.close()
+        os.replace(tmp, dest)
+
     def backup_database(self, suffix: str | None = None) -> Path:
         """Create a backup of metadata.db. Returns path to backup file."""
         if suffix is None:
             suffix = datetime.now().strftime("%Y%m%d_%H%M%S")
         backup_path = self.db_path.parent / f"metadata_backup_{suffix}.db"
-        shutil.copy2(self.db_path, backup_path)
+        self._sqlite_copy(backup_path)
         logger.info(f"Database backed up to: {backup_path}")
         return backup_path
 
@@ -453,7 +493,7 @@ class CalibreBackend:
 
             stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             backup_path = db_dir / f"{AUTO_BACKUP_PREFIX}{stamp}.db"
-            shutil.copy2(self.db_path, backup_path)
+            self._sqlite_copy(backup_path)
             logger.info(f"Auto-backup before {reason}: {backup_path}")
             return {
                 "status": "created",
@@ -467,6 +507,8 @@ class CalibreBackend:
 
     def vacuum_database(self) -> str:
         """Compact the database. Requires exclusive access (no Calibre running)."""
+        # VACUUM rewrites the whole file: same guard as every other write.
+        self.require_calibre_closed()
         # VACUUM needs write access, so we connect normally (not read-only)
         try:
             conn = sqlite3.connect(str(self.db_path), timeout=10)

@@ -175,7 +175,11 @@ def test_fix_book_paths_rejects_author_that_sanitizes_to_nothing(tmp_path):
 
 def _backend_for_backup(tmp_path, enabled: bool):
     db = tmp_path / "metadata.db"
-    db.write_bytes(b"SQLite format 3\x00" + b"0" * 512)
+    conn = sqlite3.connect(str(db))
+    conn.execute("CREATE TABLE t (x)")
+    conn.execute("INSERT INTO t VALUES (1)")
+    conn.commit()
+    conn.close()
     cfg = Config(
         calibredb_path="calibredb",
         library_path=str(tmp_path),
@@ -192,7 +196,8 @@ def test_auto_backup_creates_a_copy(tmp_path):
     backup = Path(res["backup_path"])
     assert backup.exists()
     assert backup.name.startswith(AUTO_BACKUP_PREFIX)
-    assert backup.read_bytes() == (tmp_path / "metadata.db").read_bytes()
+    # Copied through SQLite's backup API: compare contents, not raw bytes.
+    assert sqlite3.connect(str(backup)).execute("SELECT x FROM t").fetchall() == [(1,)]
 
 
 def test_auto_backup_reuses_a_recent_one(tmp_path):
@@ -300,6 +305,8 @@ def test_book_dir_case_mismatch_still_detected(tmp_path):
     d = tmp_path / "Auth" / "LIBRO (1)"
     d.mkdir(parents=True)
     (d / "Libro.epub").write_text("x")
+    if not _fs_is_case_insensitive(tmp_path):
+        pytest.skip("needs a case-insensitive filesystem (Windows/macOS)")
 
     res = verify_file_integrity(_make_backend(db))
     assert res["ok"] is False
